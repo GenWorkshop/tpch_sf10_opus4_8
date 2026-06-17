@@ -48,29 +48,32 @@ inline void run_q22_impl(Database* db, std::ostream& out) {
     // over all prefix matches, and stash prefix-matched no-order customers.
     struct Cand { int64_t acctbal; uint16_t code; };
     std::vector<Cand> cands;
-    cands.reserve((size_t)db->n_customer / 4 + 16);
+    cands.reserve((size_t)db->n_customer + 1);
     int64_t sum_bal = 0;
     int64_t count_bal = 0;
+    size_t ncand = 0;
     {
         PROFILE_SCOPE("q22_customer_scan_filter_agg");
         const int32_t n = db->n_customer;
-        const uint64_t* bm = has_orders.data();
-        const std::string* phone = db->c_phone.data();
-        const int64_t* acct = db->c_acctbal.data();
-        const uint8_t* tgt = is_target.data();
+        const uint64_t* __restrict bm = has_orders.data();
+        const std::string* __restrict phone = db->c_phone.data();
+        const int64_t* __restrict acct = db->c_acctbal.data();
+        const uint8_t* __restrict tgt = is_target.data();
+        Cand* __restrict cbuf = cands.data();
         for (int32_t i = 0; i < n; i++) {
             TRACE_INC(cust_scanned);
             const char* p = phone[i].data();
             uint16_t code = (uint16_t)(((uint8_t)p[0] << 8) | (uint8_t)p[1]);
-            if (!tgt[code]) continue;
             int64_t bal = acct[i];
-            if (bal > 0) {
-                sum_bal += bal;
-                count_bal++;
-            }
             uint32_t k = (uint32_t)(i + 1);
-            if ((bm[k >> 6] >> (k & 63)) & 1) continue;
-            cands.push_back({bal, code});
+            int64_t hit = tgt[code];
+            int64_t pos = hit & (bal > 0);
+            sum_bal += bal & -pos;
+            count_bal += pos;
+            int64_t hasord = (bm[k >> 6] >> (k & 63)) & 1;
+            int64_t keep = hit & (hasord ^ 1);
+            cbuf[ncand] = {bal, code};
+            ncand += (size_t)keep;
         }
     }
     double avg_bal = (count_bal > 0) ? (double)sum_bal / count_bal : 0.0;
@@ -83,7 +86,9 @@ inline void run_q22_impl(Database* db, std::ostream& out) {
     Agg slots[7];
     {
         PROFILE_SCOPE("q22_candidate_agg");
-        for (const Cand& c : cands) {
+        const Cand* __restrict cbuf = cands.data();
+        for (size_t ci = 0; ci < ncand; ci++) {
+            Cand c = cbuf[ci];
             if ((double)c.acctbal <= avg_bal) continue;
             TRACE_INC(cust_emitted);
             int8_t s = code_slot[c.code];
