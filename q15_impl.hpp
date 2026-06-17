@@ -15,40 +15,48 @@ inline void run_q15_impl(Database* db, std::ostream& out) {
     const Date date_lo = date_to_epoch(1996, 2, 1);
     const Date date_hi = date_to_epoch(1996, 5, 1);
 
-    // Compute total_revenue per supplier
-    std::unordered_map<int32_t, int64_t> supp_revenue; // suppkey → revenue (scale 4)
+    // Compute total_revenue per supplier using a dense array keyed by suppkey
+    // (suppkey is dense 1..n_supplier, so this is a perfect-hash group-by).
+    const int32_t n_supp = db->n_supplier;
+    std::vector<int64_t> supp_revenue(n_supp + 1, 0); // index = suppkey
 
     {
         PROFILE_SCOPE("q15_lineitem_scan_agg");
-        for (int64_t i = 0; i < db->n_lineitem; i++) {
+        const Date* __restrict shipdate = db->l_shipdate.data();
+        const int64_t* __restrict eprice = db->l_extendedprice.data();
+        const int64_t* __restrict disc = db->l_discount.data();
+        const int32_t* __restrict suppkey = db->l_suppkey.data();
+        int64_t* __restrict acc = supp_revenue.data();
+        const int64_t n = db->n_lineitem;
+        for (int64_t i = 0; i < n; i++) {
             TRACE_INC(li_scanned);
-            if (db->l_shipdate[i] >= date_lo && db->l_shipdate[i] < date_hi) {
+            const Date d = shipdate[i];
+            if (d >= date_lo && d < date_hi) {
                 TRACE_INC(li_emitted);
-                int64_t rev = db->l_extendedprice[i] * (100 - db->l_discount[i]);
-                supp_revenue[db->l_suppkey[i]] += rev;
+                acc[suppkey[i]] += eprice[i] * (100 - disc[i]);
             }
         }
     }
     TRACE_COUNT("q15_rows_scanned", li_scanned);
     TRACE_COUNT("q15_rows_emitted", li_emitted);
     TRACE_COUNT("q15_agg_rows_in", li_emitted);
-    TRACE_COUNT("q15_groups_created", (uint64_t)supp_revenue.size());
+    TRACE_COUNT("q15_groups_created", (uint64_t)n_supp);
 
     // Find max revenue
     int64_t max_rev = 0;
-    for (auto& [sk, rev] : supp_revenue) {
-        if (rev > max_rev) max_rev = rev;
+    for (int32_t sk = 1; sk <= n_supp; sk++) {
+        if (supp_revenue[sk] > max_rev) max_rev = supp_revenue[sk];
     }
 
-    // Collect suppliers with max revenue
+    // Collect suppliers with max revenue (already in suppkey order)
     struct ResultRow {
         int32_t s_suppkey;
         int64_t total_revenue;
     };
     std::vector<ResultRow> results;
-    for (auto& [sk, rev] : supp_revenue) {
-        if (rev == max_rev) {
-            results.push_back({sk, rev});
+    for (int32_t sk = 1; sk <= n_supp; sk++) {
+        if (supp_revenue[sk] == max_rev) {
+            results.push_back({sk, supp_revenue[sk]});
         }
     }
 
