@@ -111,22 +111,33 @@ inline void run_q10_impl(Database* db, std::ostream& out) {
         buf.append(p, numbuf + sizeof(numbuf) - p);
     };
     auto append_quoted = [&](const std::string& s) {
+        static const bool* SPECIAL = []{
+            static bool t[256] = {false};
+            t[(unsigned char)','] = true;
+            t[(unsigned char)'"'] = true;
+            t[(unsigned char)'\n'] = true;
+            t[(unsigned char)'\r'] = true;
+            t[(unsigned char)'\\'] = true;
+            return t;
+        }();
+        const char* d = s.data();
+        const size_t n = s.size();
         bool needs = false;
-        for (char c : s) {
-            if (c == ',' || c == '"' || c == '\n' || c == '\r' || c == '\\') { needs = true; break; }
+        for (size_t k = 0; k < n; k++) {
+            if (SPECIAL[(unsigned char)d[k]]) { needs = true; break; }
         }
-        if (!needs) { buf.append(s); return; }
+        if (!needs) { buf.append(d, n); return; }
         buf.push_back('"');
-        for (char c : s) {
-            if (c == '"') buf.push_back('"');
-            buf.push_back(c);
+        for (size_t k = 0; k < n; k++) {
+            if (d[k] == '"') buf.push_back('"');
+            buf.push_back(d[k]);
         }
         buf.push_back('"');
     };
 
     const size_t nres = results.size();
-    const int PD_FAR = 32;
-    const int PD_NEAR = 10;
+    const int PD_FAR = 48;
+    const int PD_NEAR = 16;
     for (size_t i = 0; i < nres; i++) {
         if (i + PD_FAR < nres) {
             int32_t fidx = results[i + PD_FAR].c_custkey - 1;
