@@ -18,11 +18,11 @@ inline void run_q5_impl(Database* db, std::ostream& out) {
         if (db->r_name[i] == "AFRICA") { target_regionkey = i; break; }
     }
 
-    // Nations in target region
-    std::unordered_set<int32_t> target_nations;
+    // Nations in target region → small bool table indexed by nationkey (0..24)
+    bool target_nation[64] = {false};
     for (int i = 0; i < db->n_nations; i++) {
         if (db->n_regionkey[i] == target_regionkey) {
-            target_nations.insert(i);
+            target_nation[i] = true;
         }
     }
 
@@ -30,45 +30,42 @@ inline void run_q5_impl(Database* db, std::ostream& out) {
     const Date date_lo = date_to_epoch(1997, 1, 1);
     const Date date_hi = date_to_epoch(1998, 1, 1);
 
-    // Find qualifying orders: orderdate in range AND customer's nation in target region
-    // Store order_idx → customer nationkey (for later join condition c_nationkey = s_nationkey)
-    std::vector<int32_t> order_cust_nationkey(db->n_orders, -1); // -1 = not qualifying
-    for (int32_t i = 0; i < db->n_orders; i++) {
-        if (db->o_orderdate[i] >= date_lo && db->o_orderdate[i] < date_hi) {
-            int32_t custkey = db->o_custkey[i];
-            int32_t c_idx = custkey - 1;
-            if (c_idx >= 0 && c_idx < db->n_customer) {
-                int32_t c_nation = db->c_nationkey[c_idx];
-                if (target_nations.count(c_nation)) {
-                    order_cust_nationkey[i] = c_nation;
-                }
-            }
-        }
-    }
+    // Per-nation revenue accumulators (scale 4), indexed by nationkey.
+    int64_t nation_revenue[64] = {0};
 
-    // Scan lineitem, join with qualifying orders, check s_nationkey = c_nationkey
-    // Group by nation name → sum revenue
-    std::unordered_map<int32_t, int64_t> nation_revenue; // nationkey → sum of revenue (scale 4)
+    const int32_t* __restrict o_orderdate = db->o_orderdate.data();
+    const int32_t* __restrict o_custkey   = db->o_custkey.data();
+    const int32_t* __restrict o_orderkey  = db->o_orderkey.data();
+    const int32_t* __restrict c_nationkey = db->c_nationkey.data();
+    const int32_t* __restrict s_nationkey = db->s_nationkey.data();
+    const int32_t* __restrict l_suppkey   = db->l_suppkey.data();
+    const int64_t* __restrict l_extprice  = db->l_extendedprice.data();
+    const int64_t* __restrict l_discount  = db->l_discount.data();
+    const auto* __restrict ranges = db->orderkey_lineitem_range.data();
 
+    // Join order follows the DuckDB plan bottom-up: the highly selective
+    // orders(date) ⋈ customer(nation∈AFRICA) result drives a CSR lookup into
+    // lineitem, so we only touch lineitems of qualifying orders instead of
+    // scanning all ~60M rows.
     {
         PROFILE_SCOPE("q5_lineitem_scan_join_agg");
-        for (int64_t i = 0; i < db->n_lineitem; i++) {
-            TRACE_INC(li_scanned);
-            int32_t orderkey = db->l_orderkey[i];
-            if (orderkey > db->max_orderkey) continue;
-            int32_t o_idx = db->orderkey_to_idx[orderkey];
-            if (o_idx < 0) continue;
-            int32_t c_nation = order_cust_nationkey[o_idx];
-            if (c_nation < 0) continue;
+        for (int32_t i = 0; i < db->n_orders; i++) {
+            Date od = o_orderdate[i];
+            if (od < date_lo || od >= date_hi) continue;
+            int32_t c_idx = o_custkey[i] - 1;
+            int32_t c_nation = c_nationkey[c_idx];
+            if (!target_nation[c_nation]) continue;
 
-            // Check s_nationkey = c_nationkey
-            int32_t suppkey = db->l_suppkey[i];
-            int32_t s_idx = suppkey - 1;
-            if (s_idx >= 0 && s_idx < db->n_supplier && db->s_nationkey[s_idx] == c_nation) {
-                TRACE_INC(li_emitted);
-                int64_t rev = db->l_extendedprice[i] * (100 - db->l_discount[i]); // scale 4
-                nation_revenue[c_nation] += rev;
+            int32_t ok = o_orderkey[i];
+            auto rng = ranges[ok];
+            int64_t rev = 0;
+            for (int32_t li = rng.start; li < rng.end; li++) {
+                if (s_nationkey[l_suppkey[li] - 1] == c_nation) {
+                    rev += l_extprice[li] * (100 - l_discount[li]); // scale 4
+                    TRACE_INC(li_emitted);
+                }
             }
+            nation_revenue[c_nation] += rev;
         }
     }
     TRACE_COUNT("q5_rows_scanned", li_scanned);
@@ -83,8 +80,10 @@ inline void run_q5_impl(Database* db, std::ostream& out) {
         int64_t revenue;
     };
     std::vector<ResultRow> results;
-    for (auto& [nk, rev] : nation_revenue) {
-        results.push_back({db->n_name[nk], rev});
+    for (int nk = 0; nk < db->n_nations; nk++) {
+        if (nation_revenue[nk] != 0) {
+            results.push_back({db->n_name[nk], nation_revenue[nk]});
+        }
     }
     TRACE_COUNT("q5_sort_rows_in", (uint64_t)results.size());
     {
