@@ -55,21 +55,33 @@ inline void run_q7_impl(Database* db, std::ostream& out) {
     {
         PROFILE_SCOPE("q7_lineitem_scan_join_agg");
         if (db->lineitem_sorted_by_orderkey && db->orders_sorted_by_orderkey) {
-            // Phase 1: branchless filter on (date range AND supplier nation),
-            // streaming only shipdate/suppkey sequentially (2 streams). Survivors
-            // (~2.4%) store just (lineitem_idx<<1)|supp_code. The orderkey is
-            // fetched sparsely (with prefetch) in phase 2, avoiding a third 240MB
-            // sequential stream here. Buffer is malloc'd (no zero-init).
-            int32_t* __restrict buf = (int32_t*)std::malloc((size_t)(n + 1) * sizeof(int32_t));
-            size_t np = 0;
+            // Phase 1a: pure branchless date filter over shipdate only. No
+            // dependent loads -> fully pipelined, streaming 240MB. Survivor
+            // lineitem indices (~28%) are compacted into idxbuf (malloc, no init).
             const uint32_t range = (uint32_t)(date_hi - date_lo);
+            int32_t* __restrict idxbuf = (int32_t*)std::malloc((size_t)(n + 1) * sizeof(int32_t));
+            size_t na = 0;
             for (int64_t i = 0; i < n; i++) {
-                int8_t sc = scode[lsupp[i] - 1];
-                int cond = ((uint32_t)(shipdate[i] - date_lo) <= range) & (sc >= 0);
-                buf[np] = (int32_t)((i << 1) | (sc & 1));
-                np += (size_t)cond;
+                idxbuf[na] = (int32_t)i;
+                na += (size_t)((uint32_t)(shipdate[i] - date_lo) <= range);
             }
             TRACE_ADD(li_scanned, n);
+
+            // Phase 1b: supplier-nation filter over the date survivors. The
+            // suppkey load is sparse, so prefetch it well ahead to hide latency;
+            // the 2-level dependent gather (lsupp -> scode) now runs over ~28% of
+            // the rows instead of all 60M. Survivors store (idx<<1)|supp_code.
+            int32_t* __restrict buf = (int32_t*)std::malloc((na + 1) * sizeof(int32_t));
+            size_t np = 0;
+            const int PB = 96;
+            for (size_t k = 0; k < na; k++) {
+                if (k + PB < na) __builtin_prefetch(&lsupp[idxbuf[k + PB]], 0, 0);
+                int32_t i = idxbuf[k];
+                int8_t sc = scode[lsupp[i] - 1];
+                buf[np] = (int32_t)((i << 1) | (sc & 1));
+                np += (size_t)(sc >= 0);
+            }
+            std::free(idxbuf);
 
             // Phase 2: merge-join survivors against orders (both ascending by
             // orderkey) to resolve customer nation, then aggregate. Orderkey is
