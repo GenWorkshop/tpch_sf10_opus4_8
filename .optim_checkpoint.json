@@ -3,13 +3,9 @@
   "completed_queries": [
     "q1",
     "q2",
-    "q3"
+    "q3",
+    "q4"
   ],
-  "current_query": "q4",
-  "completed_stages": [
-    "sample_plan",
-    "trace",
-    "expert_knowledge",
-    "human_reference"
-  ]
+  "current_query": "q5",
+  "completed_stages": []
 }
