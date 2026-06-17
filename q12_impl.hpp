@@ -105,42 +105,41 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
         // (cache-unfriendly) date, shipmode and orders probes.  Survivor indices
         // are ascending but sparse, so software-prefetch the scattered columns a
         // fixed distance ahead to hide the cache-miss latency.
-        constexpr int64_t PF = 48;
-        constexpr int64_t PF2 = 16;
-        constexpr int64_t PF3 = 6;
+        constexpr int64_t PF = 32;
+        constexpr int64_t PF2 = 12;
+        constexpr int64_t PF3 = 5;
         const int32_t* __restrict ok2idx = db->orderkey_to_idx.data();
         const std::string* __restrict oprio = db->o_orderpriority.data();
         const int32_t max_ok = db->max_orderkey;
         for (int64_t s = 0; s < count; s++) {
             if (s + PF < count) {
                 const int32_t j = survivors[s + PF];
-                __builtin_prefetch(&shipmode[j], 0, 1);
-                __builtin_prefetch(&orderkey[j], 0, 1);
+                __builtin_prefetch(&shipmode[j], 0, 3);
+                __builtin_prefetch(&orderkey[j], 0, 3);
             }
             if (s + PF2 < count) {
-                // orderkey[] for this index is already in cache (prefetched at PF);
-                // chase one level into orderkey_to_idx to hide its miss latency.
                 const int32_t j = survivors[s + PF2];
                 const int32_t ok = orderkey[j];
-                if (ok >= 0 && ok <= max_ok) __builtin_prefetch(&ok2idx[ok], 0, 1);
+                if (ok >= 0 && ok <= max_ok) __builtin_prefetch(&ok2idx[ok], 0, 3);
             }
             if (s + PF3 < count) {
-                // ok2idx[] entry is now warm; chase into o_orderpriority.
                 const int32_t j = survivors[s + PF3];
                 const int32_t ok = orderkey[j];
                 if (ok >= 0 && ok <= max_ok) {
                     const int32_t oi = ok2idx[ok];
-                    if (oi >= 0) __builtin_prefetch(&oprio[oi], 0, 1);
+                    if (oi >= 0) __builtin_prefetch(&oprio[oi], 0, 3);
                 }
             }
             const int32_t i = survivors[s];
 
-            // l_shipmode in ('MAIL', 'FOB')
-            const std::string& mode = shipmode[i];
+            // l_shipmode in ('MAIL','FOB'): among the 7 TPC-H modes only MAIL
+            // starts with 'M' and only FOB with 'F', so the first character is a
+            // unique discriminator — avoids full std::string comparison/strlen.
+            const char m0 = shipmode[i][0];
             Agg* g;
-            if (mode == "MAIL") {
+            if (m0 == 'M') {
                 g = &agg_mail;
-            } else if (mode == "FOB") {
+            } else if (m0 == 'F') {
                 g = &agg_fob;
             } else {
                 continue;
@@ -153,8 +152,9 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
             if (o_idx < 0) continue;
 
             TRACE_INC(li_emitted);
-            const std::string& prio = oprio[o_idx];
-            if (prio == "1-URGENT" || prio == "2-HIGH") {
+            // o_orderpriority high = '1-URGENT' or '2-HIGH' => leading digit <= '2'.
+            const char p0 = oprio[o_idx][0];
+            if (p0 <= '2') {
                 g->high_count++;
             } else {
                 g->low_count++;
