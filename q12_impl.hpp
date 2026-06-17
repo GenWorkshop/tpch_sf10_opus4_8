@@ -101,63 +101,57 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
 
         PROFILE_SCOPE("q12_pass2_probe");
 
-        // Pass 2: only the ~1/7 receiptdate survivors pay for the remaining
-        // (cache-unfriendly) date, shipmode and orders probes.  Survivor indices
-        // are ascending but sparse, so software-prefetch the scattered columns a
-        // fixed distance ahead to hide the cache-miss latency.
-        constexpr int64_t PF = 32;
-        constexpr int64_t PF2 = 12;
-        constexpr int64_t PF3 = 5;
+        // Pass 2 split into two lean, monotonic loops so each carries few
+        // concurrent random-access streams (better MLP / prefetch).
+        // 2a: gather l_shipmode (the only random stream) and compact the
+        //     surviving rows' orderkeys + group tag.  ~29% of rows survive.
+        // 2b: probe orders for the compacted (dense, ascending) orderkeys.
         const int32_t* __restrict ok2idx = db->orderkey_to_idx.data();
         const std::string* __restrict oprio = db->o_orderpriority.data();
         const int32_t max_ok = db->max_orderkey;
-        for (int64_t s = 0; s < count; s++) {
-            if (s + PF < count) {
-                const int32_t j = survivors[s + PF];
-                __builtin_prefetch(&shipmode[j], 0, 3);
-                __builtin_prefetch(&orderkey[j], 0, 3);
-            }
-            if (s + PF2 < count) {
-                const int32_t j = survivors[s + PF2];
-                const int32_t ok = orderkey[j];
-                if (ok >= 0 && ok <= max_ok) __builtin_prefetch(&ok2idx[ok], 0, 3);
-            }
-            if (s + PF3 < count) {
-                const int32_t j = survivors[s + PF3];
-                const int32_t ok = orderkey[j];
-                if (ok >= 0 && ok <= max_ok) {
-                    const int32_t oi = ok2idx[ok];
-                    if (oi >= 0) __builtin_prefetch(&oprio[oi], 0, 3);
+
+        std::unique_ptr<int32_t[]> buf_ok(new int32_t[count]);
+        std::unique_ptr<uint8_t[]> buf_fob(new uint8_t[count]);
+        int64_t m = 0;
+        {
+            constexpr int64_t PFA = 32;
+            for (int64_t s = 0; s < count; s++) {
+                if (s + PFA < count) {
+                    const int32_t j = survivors[s + PFA];
+                    __builtin_prefetch(&shipmode[j], 0, 0);
+                    __builtin_prefetch(&orderkey[j], 0, 0);
                 }
+                const int32_t i = survivors[s];
+                // Only MAIL starts with 'M' and only FOB with 'F' among the 7
+                // TPC-H shipmodes — first char is a unique branchless discriminator.
+                const char m0 = shipmode[i][0];
+                const bool mail = (m0 == 'M');
+                const bool fob  = (m0 == 'F');
+                buf_ok[m] = orderkey[i];
+                buf_fob[m] = fob ? 1 : 0;
+                m += (mail | fob);
             }
-            const int32_t i = survivors[s];
+        }
 
-            // l_shipmode in ('MAIL','FOB'): among the 7 TPC-H modes only MAIL
-            // starts with 'M' and only FOB with 'F', so the first character is a
-            // unique discriminator — avoids full std::string comparison/strlen.
-            const char m0 = shipmode[i][0];
-            Agg* g;
-            if (m0 == 'M') {
-                g = &agg_mail;
-            } else if (m0 == 'F') {
-                g = &agg_fob;
-            } else {
-                continue;
-            }
-
-            // Get order priority (perfect-hash probe into orders)
-            int32_t ok = orderkey[i];
-            if (ok > max_ok) continue;
-            int32_t o_idx = ok2idx[ok];
-            if (o_idx < 0) continue;
-
-            TRACE_INC(li_emitted);
-            // o_orderpriority high = '1-URGENT' or '2-HIGH' => leading digit <= '2'.
-            const char p0 = oprio[o_idx][0];
-            if (p0 <= '2') {
-                g->high_count++;
-            } else {
-                g->low_count++;
+        {
+            constexpr int64_t PFB = 24;
+            for (int64_t k = 0; k < m; k++) {
+                if (k + PFB < m) {
+                    const int32_t ok = buf_ok[k + PFB];
+                    if (ok >= 0 && ok <= max_ok) __builtin_prefetch(&ok2idx[ok], 0, 0);
+                }
+                const int32_t ok = buf_ok[k];
+                if (ok > max_ok) continue;
+                const int32_t o_idx = ok2idx[ok];
+                if (o_idx < 0) continue;
+                TRACE_INC(li_emitted);
+                Agg* g = buf_fob[k] ? &agg_fob : &agg_mail;
+                // high priority = '1-URGENT' or '2-HIGH' => leading digit <= '2'.
+                if (oprio[o_idx][0] <= '2') {
+                    g->high_count++;
+                } else {
+                    g->low_count++;
+                }
             }
         }
     }
