@@ -17,6 +17,7 @@
   ],
   "current_query": "q14",
   "completed_stages": [
-    "sample_plan"
+    "sample_plan",
+    "trace"
   ]
 }
