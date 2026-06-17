@@ -6,5 +6,7 @@
     "q3"
   ],
   "current_query": "q4",
-  "completed_stages": []
+  "completed_stages": [
+    "sample_plan"
+  ]
 }
