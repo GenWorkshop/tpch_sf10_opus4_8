@@ -4,6 +4,7 @@
 #include "q1_impl.hpp" // date_to_epoch
 #include <ostream>
 #include <map>
+#include <memory>
 
 inline void run_q12_impl(Database* db, std::ostream& out) {
     PROFILE_SCOPE("q12_total");
@@ -33,13 +34,34 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
     {
         PROFILE_SCOPE("q12_lineitem_scan_join_agg");
         const int64_t n = db->n_lineitem;
+        // Pass 1: branchless collection of rows whose l_receiptdate falls in the
+        // target year.  Writing the index unconditionally and bumping the count
+        // by the (0/1) predicate eliminates the hard-to-predict range branch that
+        // otherwise dominates the 60M-row scan.
+        std::unique_ptr<int32_t[]> survivors(new int32_t[n]);
+        int64_t count = 0;
         for (int64_t i = 0; i < n; i++) {
             TRACE_INC(li_scanned);
-            // l_receiptdate >= date_lo AND < date_hi  (most selective, cheap int)
             const Date rd = receiptdate[i];
-            if (rd < date_lo || rd >= date_hi) continue;
+            survivors[count] = (int32_t)i;
+            count += (rd >= date_lo) & (rd < date_hi);
+        }
 
-            // l_shipdate < l_commitdate < l_receiptdate
+        // Pass 2: only the ~1/7 receiptdate survivors pay for the remaining
+        // (cache-unfriendly) date, shipmode and orders probes.  Survivor indices
+        // are ascending but sparse, so software-prefetch the scattered columns a
+        // fixed distance ahead to hide the cache-miss latency.
+        constexpr int64_t PF = 48;
+        for (int64_t s = 0; s < count; s++) {
+            if (s + PF < count) {
+                const int32_t j = survivors[s + PF];
+                __builtin_prefetch(&commitdate[j], 0, 1);
+                __builtin_prefetch(&shipdate[j], 0, 1);
+                __builtin_prefetch(&shipmode[j], 0, 1);
+                __builtin_prefetch(&orderkey[j], 0, 1);
+            }
+            const int32_t i = survivors[s];
+            const Date rd = receiptdate[i];
             const Date cd = commitdate[i];
             if (cd >= rd) continue;
             if (shipdate[i] >= cd) continue;
