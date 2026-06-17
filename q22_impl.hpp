@@ -6,6 +6,7 @@
 #include <map>
 #include <string>
 #include <cstdint>
+#include <algorithm>
 
 inline void run_q22_impl(Database* db, std::ostream& out) {
     PROFILE_SCOPE("q22_total");
@@ -15,11 +16,15 @@ inline void run_q22_impl(Database* db, std::ostream& out) {
     // Target country codes (first 2 chars of phone) encoded as uint16 (c0<<8|c1).
     // Tiny query-time lookup table over the 2^16 possible 2-char prefixes.
     std::vector<uint8_t> is_target(65536, 0);
+    // Map each target code to a dense slot index for branch-light grouping.
+    std::vector<int8_t> code_slot(65536, -1);
     {
         const char* codes[] = {"13","17","31","23","18","29","30"};
+        int8_t s = 0;
         for (const char* c : codes) {
             uint16_t k = (uint16_t)(((uint8_t)c[0] << 8) | (uint8_t)c[1]);
             is_target[k] = 1;
+            code_slot[k] = s++;
         }
     }
 
@@ -70,20 +75,26 @@ inline void run_q22_impl(Database* db, std::ostream& out) {
     struct Agg {
         int64_t numcust = 0;
         int64_t totacctbal = 0; // scale 2
+        uint16_t code = 0;
     };
-    std::map<std::string, Agg> groups;
+    Agg slots[7];
     {
         PROFILE_SCOPE("q22_candidate_agg");
         for (const Cand& c : cands) {
             if ((double)c.acctbal <= avg_bal) continue;
             TRACE_INC(cust_emitted);
-            char buf[2] = {(char)(c.code >> 8), (char)(c.code & 0xFF)};
-            std::string code(buf, 2);
-            Agg& a = groups[code];
-            a.numcust++;
-            a.totacctbal += c.acctbal;
+            int8_t s = code_slot[c.code];
+            slots[s].numcust++;
+            slots[s].totacctbal += c.acctbal;
+            slots[s].code = c.code;
         }
     }
+    std::vector<Agg> groups;
+    for (int s = 0; s < 7; s++) {
+        if (slots[s].numcust > 0) groups.push_back(slots[s]);
+    }
+    std::sort(groups.begin(), groups.end(),
+              [](const Agg& a, const Agg& b) { return a.code < b.code; });
     TRACE_COUNT("q22_rows_scanned", cust_scanned);
     TRACE_COUNT("q22_rows_emitted", cust_emitted);
     TRACE_COUNT("q22_agg_rows_in", cust_emitted);
@@ -92,9 +103,10 @@ inline void run_q22_impl(Database* db, std::ostream& out) {
 
     PROFILE_SCOPE("q22_output");
     write_csv_header(out, {"cntrycode","numcust","totacctbal"});
-    for (auto& [code, g] : groups) {
+    for (const Agg& g : groups) {
+        char buf[2] = {(char)(g.code >> 8), (char)(g.code & 0xFF)};
         write_csv_row(out, {
-            code,
+            std::string(buf, 2),
             std::to_string(g.numcust),
             fmt_money(g.totacctbal, 2)
         });
