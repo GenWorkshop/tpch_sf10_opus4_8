@@ -37,64 +37,81 @@ inline void run_q3_impl(Database* db, std::ostream& out) {
     const Date date_filter = date_to_epoch(1995, 3, 8);
 
     // Step 1: Find customers in BUILDING segment
-    std::vector<bool> cust_building(db->n_customer, false);
+    std::vector<uint8_t> cust_building(db->n_customer, 0);
+    { PROFILE_SCOPE("q3_p1_customer");
     for (int32_t i = 0; i < db->n_customer; i++) {
         if (db->c_mktsegment[i] == "BUILDING") {
-            cust_building[i] = true;
+            cust_building[i] = 1;
         }
     }
-
-    // Step 2: Find qualifying orders (customer in BUILDING, orderdate < 1995-03-08)
-    // Store order index → true
-    std::vector<bool> order_qualifies(db->n_orders, false);
-    for (int32_t i = 0; i < db->n_orders; i++) {
-        if (db->o_orderdate[i] < date_filter) {
-            int32_t custkey = db->o_custkey[i];
-            int32_t c_idx = custkey - 1;
-            if (c_idx >= 0 && c_idx < db->n_customer && cust_building[c_idx]) {
-                order_qualifies[i] = true;
-            }
-        }
     }
 
-    // Step 3: Scan lineitem, filter l_shipdate > date_filter, join with qualifying orders
-    // Group by (l_orderkey, o_orderdate, o_shippriority) → sum revenue
-    struct GroupVal {
-        int64_t revenue; // scale 4: extprice(s2) * (100 - disc(s2)) = scale 4
-        Date o_orderdate;
-        int32_t o_shippriority;
-    };
-    std::unordered_map<int32_t, GroupVal> groups; // key = orderkey
+    // Step 2: Qualifying orders (customer in BUILDING, orderdate < 1995-03-08).
+    // Build a compact qualifies-bitmap indexed by orderkey (~max_orderkey/8
+    // bytes, L3-resident) used to cheaply gate the lineitem scan before doing
+    // any large random gathers. Branchless append avoids ~50% branch
+    // mispredictions on the orderdate filter.
+    std::vector<int32_t> qual_orders(db->n_orders);
+    std::vector<uint64_t> qbits((size_t)(db->max_orderkey) / 64 + 1, 0);
+    size_t qcount = 0;
+    { PROFILE_SCOPE("q3_p2_orders");
+    const Date* __restrict od = db->o_orderdate.data();
+    const int32_t* __restrict ock = db->o_custkey.data();
+    const int32_t* __restrict ook = db->o_orderkey.data();
+    const uint8_t* __restrict cb = cust_building.data();
+    int32_t* __restrict qo = qual_orders.data();
+    uint64_t* __restrict qbp = qbits.data();
+    const int32_t n = db->n_orders;
+    for (int32_t i = 0; i < n; i++) {
+        unsigned pass = (unsigned)(od[i] < date_filter) & cb[ock[i] - 1];
+        qo[qcount] = i;
+        qcount += pass;
+        if (pass) {
+            uint32_t ok = (uint32_t)ook[i];
+            qbp[ok >> 6] |= (uint64_t)1 << (ok & 63);
+        }
+    }
+    }
+    qual_orders.resize(qcount);
 
+    // Dense revenue accumulator indexed by order row index (touched only on
+    // the few matching lineitems, so its large size never hurts the hot loop).
+    std::vector<int64_t> order_acc;
+    { PROFILE_SCOPE("q3_p3_acc_alloc");
+    order_acc.assign(db->n_orders, 0);
+    }
+
+    // Step 3: Scan lineitem; filter l_shipdate and gate on qualifies-bitmap.
+    // Branchless: lineitem is clustered by orderkey, so the bitmap is touched
+    // in streaming order (cache-friendly), letting us drop the ~50% shipdate
+    // branch entirely.
     {
         PROFILE_SCOPE("q3_lineitem_scan_join_agg");
-        for (int64_t i = 0; i < db->n_lineitem; i++) {
+        const Date* __restrict l_shipdate = db->l_shipdate.data();
+        const int32_t* __restrict l_orderkey = db->l_orderkey.data();
+        const int64_t* __restrict l_extendedprice = db->l_extendedprice.data();
+        const int64_t* __restrict l_discount = db->l_discount.data();
+        const uint64_t* __restrict qb = qbits.data();
+        const int32_t* __restrict ok2idx = db->orderkey_to_idx.data();
+        int64_t* __restrict acc = order_acc.data();
+        const int64_t n = db->n_lineitem;
+        for (int64_t i = 0; i < n; i++) {
             TRACE_INC(li_scanned);
-            if (db->l_shipdate[i] > date_filter) {
-                int32_t orderkey = db->l_orderkey[i];
-                if (orderkey <= db->max_orderkey) {
-                    int32_t o_idx = db->orderkey_to_idx[orderkey];
-                    if (o_idx >= 0 && order_qualifies[o_idx]) {
-                        TRACE_INC(li_emitted);
-                        int64_t rev = db->l_extendedprice[i] * (100 - db->l_discount[i]);
-                        auto it = groups.find(orderkey);
-                        if (it == groups.end()) {
-                            groups[orderkey] = {rev, db->o_orderdate[o_idx], db->o_shippriority[o_idx]};
-                        } else {
-                            it->second.revenue += rev;
-                        }
-                    }
-                }
+            uint32_t ok = (uint32_t)l_orderkey[i];
+            unsigned pass = (unsigned)(l_shipdate[i] > date_filter);
+            unsigned hit = pass & (unsigned)((qb[ok >> 6] >> (ok & 63)) & 1);
+            if (hit) {
+                TRACE_INC(li_emitted);
+                int32_t o_idx = ok2idx[ok];
+                acc[o_idx] += l_extendedprice[i] * (100 - l_discount[i]);
             }
         }
     }
     TRACE_COUNT("q3_rows_scanned", li_scanned);
     TRACE_COUNT("q3_join_rows_emitted", li_emitted);
     TRACE_COUNT("q3_agg_rows_in", li_emitted);
-    TRACE_COUNT("q3_groups_created", (uint64_t)groups.size());
-    TRACE_COUNT("q3_agg_rows_emitted", (uint64_t)groups.size());
 
-    // Step 4: Sort by revenue desc, o_orderdate asc
+    // Step 4: Collect results from qualifying orders that matched a lineitem.
     struct ResultRow {
         int32_t orderkey;
         int64_t revenue;
@@ -102,10 +119,16 @@ inline void run_q3_impl(Database* db, std::ostream& out) {
         int32_t o_shippriority;
     };
     std::vector<ResultRow> results;
-    results.reserve(groups.size());
-    for (auto& [ok, g] : groups) {
-        results.push_back({ok, g.revenue, g.o_orderdate, g.o_shippriority});
+    results.reserve(qual_orders.size());
+    for (int32_t idx : qual_orders) {
+        int64_t rev = order_acc[idx];
+        if (rev > 0) {
+            results.push_back({db->o_orderkey[idx], rev,
+                               db->o_orderdate[idx], db->o_shippriority[idx]});
+        }
     }
+    TRACE_COUNT("q3_groups_created", (uint64_t)results.size());
+    TRACE_COUNT("q3_agg_rows_emitted", (uint64_t)results.size());
     TRACE_COUNT("q3_sort_rows_in", (uint64_t)results.size());
     {
         PROFILE_SCOPE("q3_sort");
