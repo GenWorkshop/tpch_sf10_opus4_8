@@ -17,66 +17,72 @@ inline void run_q4_impl(Database* db, std::ostream& out) {
     const Date date_lo = date_to_epoch(1993, 9, 1);
     const Date date_hi = date_to_epoch(1993, 12, 1);
 
-    // Build set of orderkeys that have at least one lineitem with commitdate < receiptdate
-    std::vector<bool> order_has_late(db->max_orderkey + 1, false);
+    // o_orderpriority is one of 5 values "1-URGENT".."5-LOW"; bucket by first
+    // digit (1..9 -> idx 0..8) and remember the full string for output.
+    int64_t cnt[10] = {0};
+    const std::string* repr[10] = {nullptr};
 
-    {
-        PROFILE_SCOPE("q4_lineitem_semijoin");
-        if (db->lineitem_sorted_by_orderkey) {
-            // Use CSR index
-            for (int32_t i = 0; i < db->n_orders; i++) {
-                int32_t ok = db->o_orderkey[i];
-                if (db->o_orderdate[i] >= date_lo && db->o_orderdate[i] < date_hi) {
-                    int64_t start = db->orderkey_lineitem_start[ok];
-                    int64_t end = db->orderkey_lineitem_end[ok];
-                    for (int64_t j = start; j < end; j++) {
-                        TRACE_INC(li_probed);
-                        if (db->l_commitdate[j] < db->l_receiptdate[j]) {
-                            order_has_late[ok] = true;
-                            break;
-                        }
-                    }
+    if (db->lineitem_sorted_by_orderkey) {
+        // Single fused pass: orders date filter + CSR semi-join probe + aggregate.
+        PROFILE_SCOPE("q4_orders_scan_agg");
+        const Date* __restrict odate = db->o_orderdate.data();
+        const int32_t* __restrict okey = db->o_orderkey.data();
+        const int64_t* __restrict ls = db->orderkey_lineitem_start.data();
+        const int64_t* __restrict le = db->orderkey_lineitem_end.data();
+        const Date* __restrict lc = db->l_commitdate.data();
+        const Date* __restrict lr = db->l_receiptdate.data();
+        for (int32_t i = 0; i < db->n_orders; i++) {
+            TRACE_INC(orders_scanned);
+            Date d = odate[i];
+            if (d >= date_lo && d < date_hi) {
+                int32_t ok = okey[i];
+                int64_t start = ls[ok];
+                int64_t end = le[ok];
+                bool late = false;
+                for (int64_t j = start; j < end; j++) {
+                    TRACE_INC(li_probed);
+                    if (lc[j] < lr[j]) { late = true; break; }
                 }
-            }
-        } else {
-            // Scan all lineitem to find orders with late receipts
-            for (int64_t i = 0; i < db->n_lineitem; i++) {
-                TRACE_INC(li_probed);
-                if (db->l_commitdate[i] < db->l_receiptdate[i]) {
-                    int32_t ok = db->l_orderkey[i];
-                    if (ok <= db->max_orderkey) {
-                        order_has_late[ok] = true;
-                    }
+                if (late) {
+                    TRACE_INC(orders_emitted);
+                    const std::string& p = db->o_orderpriority[i];
+                    int b = (int)((unsigned char)p[0] - '1');
+                    cnt[b]++;
+                    if (!repr[b]) repr[b] = &p;
                 }
             }
         }
-    }
-
-    // Count by orderpriority
-    std::map<std::string, int64_t> counts;
-    {
-        PROFILE_SCOPE("q4_orders_scan_agg");
+    } else {
+        // Fallback: build late-order bitmap from full lineitem scan, then aggregate.
+        std::vector<bool> order_has_late(db->max_orderkey + 1, false);
+        for (int64_t i = 0; i < db->n_lineitem; i++) {
+            TRACE_INC(li_probed);
+            if (db->l_commitdate[i] < db->l_receiptdate[i]) {
+                int32_t ok = db->l_orderkey[i];
+                if (ok <= db->max_orderkey) order_has_late[ok] = true;
+            }
+        }
         for (int32_t i = 0; i < db->n_orders; i++) {
             TRACE_INC(orders_scanned);
             if (db->o_orderdate[i] >= date_lo && db->o_orderdate[i] < date_hi) {
-                int32_t ok = db->o_orderkey[i];
-                if (order_has_late[ok]) {
+                if (order_has_late[db->o_orderkey[i]]) {
                     TRACE_INC(orders_emitted);
-                    counts[db->o_orderpriority[i]]++;
+                    const std::string& p = db->o_orderpriority[i];
+                    int b = (int)((unsigned char)p[0] - '1');
+                    cnt[b]++;
+                    if (!repr[b]) repr[b] = &p;
                 }
             }
         }
     }
+
     TRACE_COUNT("q4_probe_rows_in", li_probed);
     TRACE_COUNT("q4_rows_scanned", orders_scanned);
     TRACE_COUNT("q4_rows_emitted", orders_emitted);
-    TRACE_COUNT("q4_groups_created", (uint64_t)counts.size());
-    TRACE_COUNT("q4_agg_rows_emitted", (uint64_t)counts.size());
 
     PROFILE_SCOPE("q4_output");
     write_csv_header(out, {"o_orderpriority","order_count"});
-    for (auto& [prio, cnt] : counts) {
-        write_csv_row(out, {prio, std::to_string(cnt)});
+    for (int b = 0; b < 10; b++) {
+        if (repr[b]) write_csv_row(out, {*repr[b], std::to_string(cnt[b])});
     }
-    TRACE_COUNT("q4_query_output_rows", (uint64_t)counts.size());
 }
