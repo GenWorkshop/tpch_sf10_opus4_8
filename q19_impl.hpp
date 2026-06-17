@@ -4,6 +4,8 @@
 #include <ostream>
 #include <unordered_set>
 #include <string>
+#include <vector>
+#include <memory>
 
 inline void run_q19_impl(Database* db, std::ostream& out) {
     PROFILE_SCOPE("q19_total");
@@ -31,53 +33,82 @@ inline void run_q19_impl(Database* db, std::ostream& out) {
         if (db->l_shipmode_dict[d] == "AIR" || db->l_shipmode_dict[d] == "AIR REG")
             air_code[d] = true;
 
+    // Build side of the hash join (mirrors the plan's HASH_JOIN on `part`):
+    // scan the 2M-row part table once and reduce each part to a single group
+    // tag (1/2/3, or 0 = non-matching).  All the std::string brand/container
+    // comparisons happen here, off the 60M-row probe path.  The resulting
+    // ~2MB byte array stays L2-resident for cheap random probing.
+    const int32_t n_part = db->n_part;
+    std::vector<uint8_t> pgroup(n_part, 0);
+    {
+        PROFILE_SCOPE("q19_part_build");
+        const std::string* __restrict pb = db->p_brand.data();
+        const std::string* __restrict pc = db->p_container.data();
+        const int32_t* __restrict ps = db->p_size.data();
+        for (int32_t p = 0; p < n_part; p++) {
+            const std::string& brand = pb[p];
+            const std::string& container = pc[p];
+            const int32_t sz = ps[p];
+            uint8_t g = 0;
+            if (brand == "Brand#14" && sz <= 5 &&
+                (container == "SM CASE" || container == "SM BOX" || container == "SM PACK" || container == "SM PKG")) {
+                g = 1;
+            } else if (brand == "Brand#15" && sz <= 10 &&
+                (container == "MED BAG" || container == "MED BOX" || container == "MED PKG" || container == "MED PACK")) {
+                g = 2;
+            } else if (brand == "Brand#35" && sz <= 15 &&
+                (container == "LG CASE" || container == "LG BOX" || container == "LG PACK" || container == "LG PKG")) {
+                g = 3;
+            }
+            pgroup[p] = g;
+        }
+    }
+
+    // Per-group l_quantity range (scale 2), indexed by group tag.
+    static const int64_t qlo[4] = {0, 100, 1700, 2800};
+    static const int64_t qhi[4] = {0, 1100, 2700, 3800};
+
     {
         PROFILE_SCOPE("q19_lineitem_scan_join_filter");
         const uint8_t* __restrict si = db->l_shipinstruct_code.data();
         const uint8_t* __restrict sm = db->l_shipmode_code.data();
-        for (int64_t i = 0; i < db->n_lineitem; i++) {
-            TRACE_INC(li_scanned);
-            // Common filters first: single-byte dictionary-code comparisons
-            // instead of streaming 32-byte std::string objects per row.
-            if (si[i] != deliver_code) continue;
-            if (!air_code[sm[i]]) continue;
-            int32_t partkey = db->l_partkey[i];
-            int32_t p_idx = partkey - 1;
-            if (p_idx < 0 || p_idx >= db->n_part) continue;
+        const int32_t* __restrict lpk = db->l_partkey.data();
+        const int64_t* __restrict lqty = db->l_quantity.data();
+        const int64_t* __restrict lprice = db->l_extendedprice.data();
+        const int64_t* __restrict ldisc = db->l_discount.data();
+        const uint8_t* __restrict pg = pgroup.data();
+        const int64_t n = db->n_lineitem;
 
-            int64_t qty = db->l_quantity[i]; // scale 2
-            int32_t psize = db->p_size[p_idx];
-            const auto& brand = db->p_brand[p_idx];
-            const auto& container = db->p_container[p_idx];
+        // Pass 1: branchless collection of rows passing the two single-byte
+        // dictionary filters.  Writing the index unconditionally and advancing
+        // the cursor by the (0/1) predicate removes the hard-to-predict branch
+        // that otherwise dominates the 60M-row scan.
+        std::unique_ptr<int32_t[]> cand(new int32_t[n]);
+        int64_t cnt = 0;
+        for (int64_t i = 0; i < n; i++) {
+            const int keep = (si[i] == deliver_code) & (int)air_code[sm[i]];
+            cand[cnt] = (int32_t)i;
+            cnt += keep;
+        }
+        TRACE_ADD(li_scanned, (uint64_t)n);
 
-            bool match = false;
-
-            // Group 1: Brand#14, SM containers, qty [1,11] (scale 2: [100, 1100]), size [1,5]
-            if (brand == "Brand#14" &&
-                (container == "SM CASE" || container == "SM BOX" || container == "SM PACK" || container == "SM PKG") &&
-                qty >= 100 && qty <= 1100 &&
-                psize >= 1 && psize <= 5) {
-                match = true;
+        // Pass 2: probe the L2-resident part-group table for the surviving
+        // ~7% of rows and apply the per-group quantity range.
+        constexpr int64_t PF = 32;
+        for (int64_t s = 0; s < cnt; s++) {
+            if (s + PF < cnt) {
+                const uint32_t pj = (uint32_t)(lpk[cand[s + PF]] - 1);
+                if (pj < (uint32_t)n_part) __builtin_prefetch(&pg[pj], 0, 0);
             }
-            // Group 2: Brand#15, MED containers, qty [17,27] (scale 2: [1700, 2700]), size [1,10]
-            else if (brand == "Brand#15" &&
-                (container == "MED BAG" || container == "MED BOX" || container == "MED PKG" || container == "MED PACK") &&
-                qty >= 1700 && qty <= 2700 &&
-                psize >= 1 && psize <= 10) {
-                match = true;
-            }
-            // Group 3: Brand#35, LG containers, qty [28,38] (scale 2: [2800, 3800]), size [1,15]
-            else if (brand == "Brand#35" &&
-                (container == "LG CASE" || container == "LG BOX" || container == "LG PACK" || container == "LG PKG") &&
-                qty >= 2800 && qty <= 3800 &&
-                psize >= 1 && psize <= 15) {
-                match = true;
-            }
-
-            if (match) {
-                TRACE_INC(li_emitted);
-                revenue += (__int128)db->l_extendedprice[i] * (100 - db->l_discount[i]);
-            }
+            const int32_t i = cand[s];
+            const uint32_t p_idx = (uint32_t)(lpk[i] - 1);
+            if (p_idx >= (uint32_t)n_part) continue;
+            const uint8_t g = pg[p_idx];
+            if (!g) continue;
+            const int64_t qty = lqty[i];
+            if (qty < qlo[g] || qty > qhi[g]) continue;
+            TRACE_INC(li_emitted);
+            revenue += (__int128)lprice[i] * (100 - ldisc[i]);
         }
     }
     TRACE_COUNT("q19_rows_scanned", li_scanned);
