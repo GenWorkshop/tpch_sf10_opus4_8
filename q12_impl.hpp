@@ -5,6 +5,59 @@
 #include <ostream>
 #include <map>
 #include <memory>
+#include <immintrin.h>
+
+// AVX2 left-pack stream compaction for q12 pass 1: keep the indices of rows
+// satisfying l_shipdate < l_commitdate < l_receiptdate AND
+// l_receiptdate in [lo, hi).  Computes 8 date predicates per instruction and
+// only pays the permute/store when a block contains a survivor.
+__attribute__((target("avx2")))
+static int64_t q12_pass1_avx2(const int32_t* __restrict rd,
+                              const int32_t* __restrict cd,
+                              const int32_t* __restrict sd,
+                              int64_t n, int32_t lo, int32_t hi,
+                              int32_t* __restrict out) {
+    alignas(32) static int32_t perm_table[256][8];
+    static bool init = false;
+    if (!init) {
+        for (int m = 0; m < 256; m++) {
+            int p = 0;
+            for (int b = 0; b < 8; b++) if (m & (1 << b)) perm_table[m][p++] = b;
+            for (; p < 8; p++) perm_table[m][p] = 0;
+        }
+        init = true;
+    }
+    const __m256i vlo1 = _mm256_set1_epi32(lo - 1); // r > lo-1  <=>  r >= lo
+    const __m256i vhi  = _mm256_set1_epi32(hi);
+    const __m256i iota = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    int64_t count = 0;
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256i r = _mm256_loadu_si256((const __m256i*)(rd + i));
+        __m256i c = _mm256_loadu_si256((const __m256i*)(cd + i));
+        __m256i s = _mm256_loadu_si256((const __m256i*)(sd + i));
+        __m256i m1 = _mm256_cmpgt_epi32(r, vlo1); // r >= lo
+        __m256i m2 = _mm256_cmpgt_epi32(vhi, r);  // r < hi
+        __m256i m3 = _mm256_cmpgt_epi32(r, c);    // c < r
+        __m256i m4 = _mm256_cmpgt_epi32(c, s);    // s < c
+        __m256i mask = _mm256_and_si256(_mm256_and_si256(m1, m2),
+                                        _mm256_and_si256(m3, m4));
+        int mm = _mm256_movemask_ps(_mm256_castsi256_ps(mask));
+        if (mm) {
+            __m256i idx  = _mm256_add_epi32(iota, _mm256_set1_epi32((int)i));
+            __m256i perm = _mm256_load_si256((const __m256i*)perm_table[mm]);
+            __m256i pkd  = _mm256_permutevar8x32_epi32(idx, perm);
+            _mm256_storeu_si256((__m256i*)(out + count), pkd);
+            count += __builtin_popcount((unsigned)mm);
+        }
+    }
+    for (; i < n; i++) {
+        int32_t r = rd[i], c = cd[i], s = sd[i];
+        out[count] = (int32_t)i;
+        count += (r >= lo) & (r < hi) & (c < r) & (s < c);
+    }
+    return count;
+}
 
 inline void run_q12_impl(Database* db, std::ostream& out) {
     PROFILE_SCOPE("q12_total");
@@ -39,17 +92,11 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
         // by the (0/1) predicate eliminates the hard-to-predict range branch that
         // otherwise dominates the 60M-row scan.
         std::unique_ptr<int32_t[]> survivors(new int32_t[n]);
-        int64_t count = 0;
+        int64_t count;
         {
         PROFILE_SCOPE("q12_pass1_receiptdate_filter");
-        for (int64_t i = 0; i < n; i++) {
-            TRACE_INC(li_scanned);
-            const Date rd = receiptdate[i];
-            const Date cd = commitdate[i];
-            const Date sd = shipdate[i];
-            survivors[count] = (int32_t)i;
-            count += (rd >= date_lo) & (rd < date_hi) & (cd < rd) & (sd < cd);
-        }
+        count = q12_pass1_avx2(receiptdate, commitdate, shipdate, n,
+                               date_lo, date_hi, survivors.get());
         }
 
         PROFILE_SCOPE("q12_pass2_probe");
