@@ -36,12 +36,13 @@ inline void run_q3_impl(Database* db, std::ostream& out) {
     // l_shipdate > '1995-03-08'
     const Date date_filter = date_to_epoch(1995, 3, 8);
 
-    // Step 1: Find customers in BUILDING segment
-    std::vector<uint8_t> cust_building(db->n_customer, 0);
+    // Step 1: Find customers in BUILDING segment. Store as a bitmap (~n/8
+    // bytes) so the per-order random gather in step 2 stays L2-resident.
+    std::vector<uint64_t> cust_building((size_t)db->n_customer / 64 + 1, 0);
     { PROFILE_SCOPE("q3_p1_customer");
     for (int32_t i = 0; i < db->n_customer; i++) {
         if (db->c_mktsegment[i] == "BUILDING") {
-            cust_building[i] = 1;
+            cust_building[(size_t)i >> 6] |= (uint64_t)1 << (i & 63);
         }
     }
     }
@@ -58,12 +59,14 @@ inline void run_q3_impl(Database* db, std::ostream& out) {
     const Date* __restrict od = db->o_orderdate.data();
     const int32_t* __restrict ock = db->o_custkey.data();
     const int32_t* __restrict ook = db->o_orderkey.data();
-    const uint8_t* __restrict cb = cust_building.data();
+    const uint64_t* __restrict cb = cust_building.data();
     int32_t* __restrict qo = qual_orders.data();
     uint64_t* __restrict qbp = qbits.data();
     const int32_t n = db->n_orders;
     for (int32_t i = 0; i < n; i++) {
-        unsigned pass = (unsigned)(od[i] < date_filter) & cb[ock[i] - 1];
+        uint32_t c = (uint32_t)(ock[i] - 1);
+        unsigned bld = (unsigned)((cb[c >> 6] >> (c & 63)) & 1);
+        unsigned pass = (unsigned)(od[i] < date_filter) & bld;
         qo[qcount] = i;
         qcount += pass;
         if (pass) {
