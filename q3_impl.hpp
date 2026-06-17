@@ -40,8 +40,12 @@ inline void run_q3_impl(Database* db, std::ostream& out) {
     // bytes) so the per-order random gather in step 2 stays L2-resident.
     std::vector<uint64_t> cust_building((size_t)db->n_customer / 64 + 1, 0);
     { PROFILE_SCOPE("q3_p1_customer");
-    for (int32_t i = 0; i < db->n_customer; i++) {
-        if (db->c_mktsegment[i] == "BUILDING") {
+    const std::string* __restrict ms = db->c_mktsegment.data();
+    const int32_t nc = db->n_customer;
+    for (int32_t i = 0; i < nc; i++) {
+        const std::string& s = ms[i];
+        // "BUILDING" is the only segment of length 8 starting with 'B'.
+        if (s.size() == 8 && s[0] == 'B') {
             cust_building[(size_t)i >> 6] |= (uint64_t)1 << (i & 63);
         }
     }
