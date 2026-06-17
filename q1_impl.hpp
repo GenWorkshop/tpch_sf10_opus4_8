@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <sstream>
 #include <map>
+#include <vector>
 #include <cmath>
 
 // q1: lineitem scan with date filter, group by returnflag+linestatus, aggregate
@@ -35,44 +36,58 @@ static void run_q1(Database* db, const std::string& run_nr) {
         int64_t count = 0;
     };
 
-    // Use ordered map with key = (returnflag, linestatus) for sorted output
-    std::map<std::pair<char,char>, Agg> groups;
+    // Perfect-hash group-by: group count is tiny (returnflag x linestatus).
+    // Index directly by (returnflag<<7 | linestatus) into a flat array to avoid
+    // per-row tree/hash lookups over the full lineitem scan.
+    constexpr int IDX = 128 * 128;
+    static thread_local std::vector<Agg> table;
+    table.assign(IDX, Agg{});
+
+    const int32_t* __restrict shipdate = db->l_shipdate.data();
+    const char* __restrict returnflag = db->l_returnflag.data();
+    const char* __restrict linestatus = db->l_linestatus.data();
+    const int64_t* __restrict quantity = db->l_quantity.data();
+    const int64_t* __restrict extprice = db->l_extendedprice.data();
+    const int64_t* __restrict discount = db->l_discount.data();
+    const int64_t* __restrict tax = db->l_tax.data();
 
     TRACE_DECL(rows_scanned);
     TRACE_DECL(rows_emitted);
     {
         PROFILE_SCOPE("q1_scan_agg");
-        for (int64_t i = 0; i < db->lineitem_count; i++) {
+        const int64_t n = db->lineitem_count;
+        for (int64_t i = 0; i < n; i++) {
             TRACE_INC(rows_scanned);
-            if (db->l_shipdate[i] <= max_shipdate) {
+            if (shipdate[i] <= max_shipdate) {
                 TRACE_INC(rows_emitted);
-                char rf = db->l_returnflag[i];
-            char ls = db->l_linestatus[i];
-            auto& agg = groups[{rf, ls}];
+                int key = (((unsigned char)returnflag[i]) << 7) | (unsigned char)linestatus[i];
+                Agg& agg = table[key];
 
-            int64_t qty = db->l_quantity[i];       // scale 2
-            int64_t price = db->l_extendedprice[i]; // scale 2
-            int64_t disc = db->l_discount[i];       // scale 2
-            int64_t tax = db->l_tax[i];             // scale 2
+                int64_t qty = quantity[i];   // scale 2
+                int64_t price = extprice[i]; // scale 2
+                int64_t disc = discount[i];  // scale 2
+                int64_t tx = tax[i];         // scale 2
 
-            agg.sum_qty += qty;
-            agg.sum_base_price += price;
-            // disc_price = price * (1 - disc/100) = price * (100 - disc) / 100
-            // But scale: price is scale2, disc is scale2
-            // price*(1-discount): price(scale2) * (100 - disc)(scale2 value representing 1-d)
-            // Actually: l_discount stored as scale2, so 0.05 = 5
-            // 1 - l_discount in raw: 100 - disc_raw (since 1.00 = 100 in scale2)
-            // price * (100 - disc) gives scale4 result
-            __int128 disc_price = (__int128)price * (100 - disc);
-            agg.sum_disc_price += disc_price;
-            // charge = disc_price * (1 + tax) = disc_price * (100 + tax) / 100
-            // disc_price is scale4, (100+tax) is scale2 magnitude -> result scale6
-            __int128 charge = disc_price * (100 + tax);
-            agg.sum_charge += charge;
-            agg.sum_discount += disc;
-            agg.count++;
+                agg.sum_qty += qty;
+                agg.sum_base_price += price;
+                __int128 disc_price = (__int128)price * (100 - disc);
+                agg.sum_disc_price += disc_price;
+                agg.sum_charge += disc_price * (100 + tx);
+                agg.sum_discount += disc;
+                agg.count++;
+            }
         }
     }
+
+    // Collect populated groups in sorted (returnflag, linestatus) order; index
+    // order already matches because key = returnflag<<7 | linestatus.
+    std::vector<std::pair<std::pair<char,char>, Agg*>> groups;
+    for (int k = 0; k < IDX; k++) {
+        if (table[k].count) {
+            char rf = (char)(k >> 7);
+            char ls = (char)(k & 127);
+            groups.push_back({{rf, ls}, &table[k]});
+        }
     }
     TRACE_COUNT("q1_rows_scanned", rows_scanned);
     TRACE_COUNT("q1_rows_emitted", rows_emitted);
@@ -86,7 +101,8 @@ static void run_q1(Database* db, const std::string& run_nr) {
     write_csv_header(oss, {"l_returnflag","l_linestatus","sum_qty","sum_base_price",
                            "sum_disc_price","sum_charge","avg_qty","avg_price","avg_disc","count_order"});
 
-    for (auto& [key, agg] : groups) {
+    for (auto& [key, aggp] : groups) {
+        Agg& agg = *aggp;
         std::string rf(1, key.first);
         std::string ls(1, key.second);
 
