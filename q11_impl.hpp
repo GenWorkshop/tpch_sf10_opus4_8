@@ -22,10 +22,10 @@ inline void run_q11_impl(Database* db, std::ostream& out) {
 
     // Dense per-partkey accumulator (partkey is 1-based dense).
     // product = ps_supplycost(scale 2) * ps_availqty(int) -> scale 2.
-    std::vector<__int128> partkey_value(db->n_part + 1, 0);
+    std::vector<int64_t> partkey_value(db->n_part + 1, 0);
     std::vector<int32_t> touched;
     touched.reserve(db->n_partsupp / 20 + 16);
-    __int128 total_value = 0;
+    int64_t total_value = 0;
 
     {
         PROFILE_SCOPE("q11_partsupp_scan_agg");
@@ -34,15 +34,21 @@ inline void run_q11_impl(Database* db, std::ostream& out) {
         const int32_t* __restrict ps_availqty = db->ps_availqty.data();
         const int64_t* __restrict ps_supplycost = db->ps_supplycost.data();
         const uint8_t* __restrict mem = supp_in_russia.data();
-        __int128* __restrict acc = partkey_value.data();
+        int64_t* __restrict acc = partkey_value.data();
         const int32_t n = db->n_partsupp;
+        constexpr int PD = 128;
         for (int32_t i = 0; i < n; i++) {
+            if ((i & 7) == 0 && i + PD < n) {
+                __builtin_prefetch(&ps_supplycost[i + PD], 0, 0);
+                __builtin_prefetch(&ps_availqty[i + PD], 0, 0);
+                __builtin_prefetch(&ps_partkey[i + PD], 0, 0);
+            }
             TRACE_INC(ps_scanned);
             if (mem[ps_suppkey[i]]) {
                 TRACE_INC(ps_emitted);
-                __int128 val = (__int128)ps_supplycost[i] * ps_availqty[i];
+                int64_t val = (int64_t)ps_supplycost[i] * ps_availqty[i];
                 int32_t pk = ps_partkey[i];
-                __int128 prev = acc[pk];
+                int64_t prev = acc[pk];
                 if (prev == 0) touched.push_back(pk);
                 acc[pk] = prev + val;
                 total_value += val;
@@ -62,7 +68,7 @@ inline void run_q11_impl(Database* db, std::ostream& out) {
     std::vector<ResultRow> results;
     results.reserve(touched.size());
     for (int32_t pk : touched) {
-        __int128 val = partkey_value[pk];
+        int64_t val = partkey_value[pk];
         if (val * 10000 > total_value) {
             results.push_back({pk, static_cast<long long>(val)});
         }
