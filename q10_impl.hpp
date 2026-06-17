@@ -163,27 +163,47 @@ inline void run_q10_impl(Database* db, std::ostream& out) {
     TRACE_COUNT("q10_groups_created", (uint64_t)recs.size());
     TRACE_COUNT("q10_agg_rows_emitted", (uint64_t)recs.size());
 
-    // Order by revenue desc
+    // Order by revenue desc.  revenue is a non-negative fixed-width integer key,
+    // so use an LSD radix sort (ascending) instead of comparison sort, then emit
+    // in reverse for descending order (tip 16).
     TRACE_COUNT("q10_sort_rows_in", (uint64_t)recs.size());
     {
         PROFILE_SCOPE("q10_sort");
-        std::sort(recs.begin(), recs.end(), [](const Rec& a, const Rec& b) {
-            return a.revenue > b.revenue;
-        });
+        const size_t n = recs.size();
+        if (n > 1) {
+            uint64_t orbits = 0;
+            for (size_t i = 0; i < n; i++) orbits |= (uint64_t)recs[i].revenue;
+            std::vector<Rec> tmp(n);
+            Rec* src = recs.data();
+            Rec* dst = tmp.data();
+            for (int shift = 0; shift < 64 && (orbits >> shift) != 0; shift += 8) {
+                size_t count[257] = {0};
+                for (size_t i = 0; i < n; i++)
+                    count[((uint64_t)src[i].revenue >> shift) & 0xFF]++;
+                size_t sum = 0;
+                for (int b = 0; b < 256; b++) { size_t c = count[b]; count[b] = sum; sum += c; }
+                for (size_t i = 0; i < n; i++)
+                    dst[count[((uint64_t)src[i].revenue >> shift) & 0xFF]++] = src[i];
+                std::swap(src, dst);
+            }
+            if (src != recs.data())
+                std::copy(src, src + n, recs.data());
+        }
     }
     TRACE_COUNT("q10_sort_rows_out", (uint64_t)recs.size());
 
     PROFILE_SCOPE("q10_output");
     write_csv_header(out, {"c_custkey","c_name","revenue","c_acctbal","n_name","c_address","c_phone","c_comment"});
 
-    // Pass 2: stitch fragments in revenue order into the final buffer.
+    // Pass 2: stitch fragments into the final buffer.  recs is sorted ascending
+    // by revenue, so iterate in reverse for descending output order.
     std::string buf;
     buf.reserve(frag.size() + 64);
     const char* fbase = frag.data();
     const size_t nres = recs.size();
     const int PD = 24;
-    for (size_t i = 0; i < nres; i++) {
-        if (i + PD < nres) __builtin_prefetch(fbase + recs[i + PD].off);
+    for (size_t i = nres; i-- > 0; ) {
+        if (i >= (size_t)PD) __builtin_prefetch(fbase + recs[i - PD].off);
         buf.append(fbase + recs[i].off, recs[i].len);
     }
     out.write(buf.data(), (std::streamsize)buf.size());
