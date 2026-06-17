@@ -55,12 +55,15 @@ inline void run_q22_impl(Database* db, std::ostream& out) {
         PROFILE_SCOPE("q22_customer_scan_filter_agg");
         const int32_t n = db->n_customer;
         const uint64_t* bm = has_orders.data();
+        const std::string* phone = db->c_phone.data();
+        const int64_t* acct = db->c_acctbal.data();
+        const uint8_t* tgt = is_target.data();
         for (int32_t i = 0; i < n; i++) {
             TRACE_INC(cust_scanned);
-            const std::string& ph = db->c_phone[i];
-            uint16_t code = (uint16_t)(((uint8_t)ph[0] << 8) | (uint8_t)ph[1]);
-            if (!is_target[code]) continue;
-            int64_t bal = db->c_acctbal[i];
+            const char* p = phone[i].data();
+            uint16_t code = (uint16_t)(((uint8_t)p[0] << 8) | (uint8_t)p[1]);
+            if (!tgt[code]) continue;
+            int64_t bal = acct[i];
             if (bal > 0) {
                 sum_bal += bal;
                 count_bal++;
