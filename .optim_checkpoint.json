@@ -7,13 +7,9 @@
     "q4",
     "q5",
     "q6",
-    "q7"
+    "q7",
+    "q8"
   ],
-  "current_query": "q8",
-  "completed_stages": [
-    "sample_plan",
-    "trace",
-    "expert_knowledge",
-    "human_reference"
-  ]
+  "current_query": "q9",
+  "completed_stages": []
 }
