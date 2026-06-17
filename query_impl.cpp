@@ -11,6 +11,26 @@
 #include "query_utils.hpp"
 #include "q1_impl.hpp"
 #include "q2_impl.hpp"
+#include "q3_impl.hpp"
+#include "q4_impl.hpp"
+#include "q5_impl.hpp"
+#include "q6_impl.hpp"
+#include "q7_impl.hpp"
+#include "q8_impl.hpp"
+#include "q9_impl.hpp"
+#include "q10_impl.hpp"
+#include "q11_impl.hpp"
+#include "q12_impl.hpp"
+#include "q13_impl.hpp"
+#include "q14_impl.hpp"
+#include "q15_impl.hpp"
+#include "q16_impl.hpp"
+#include "q17_impl.hpp"
+#include "q18_impl.hpp"
+#include "q19_impl.hpp"
+#include "q20_impl.hpp"
+#include "q21_impl.hpp"
+#include "q22_impl.hpp"
 
 // Forward declarations for each query
 static void run_q1(Database* db, const std::string& args, std::ostream& out);
@@ -113,81 +133,81 @@ static void run_q2(Database* db, const std::string& args, std::ostream& out) {
 }
 
 static void run_q3(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"l_orderkey","revenue","o_orderdate","o_shippriority"});
+    run_q3_impl(db, out);
 }
 
 static void run_q4(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"o_orderpriority","order_count"});
+    run_q4_impl(db, out);
 }
 
 static void run_q5(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"n_name","revenue"});
+    run_q5_impl(db, out);
 }
 
 static void run_q6(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"revenue"});
+    run_q6_impl(db, out);
 }
 
 static void run_q7(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"supp_nation","cust_nation","l_year","revenue"});
+    run_q7_impl(db, out);
 }
 
 static void run_q8(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"o_year","mkt_share"});
+    run_q8_impl(db, out);
 }
 
 static void run_q9(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"nation","o_year","sum_profit"});
+    run_q9_impl(db, out);
 }
 
 static void run_q10(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"c_custkey","c_name","revenue","c_acctbal","n_name","c_address","c_phone","c_comment"});
+    run_q10_impl(db, out);
 }
 
 static void run_q11(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"ps_partkey","value"});
+    run_q11_impl(db, out);
 }
 
 static void run_q12(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"l_shipmode","high_line_count","low_line_count"});
+    run_q12_impl(db, out);
 }
 
 static void run_q13(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"c_count","custdist"});
+    run_q13_impl(db, out);
 }
 
 static void run_q14(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"promo_revenue"});
+    run_q14_impl(db, out);
 }
 
 static void run_q15(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"s_suppkey","s_name","s_address","s_phone","total_revenue"});
+    run_q15_impl(db, out);
 }
 
 static void run_q16(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"p_brand","p_type","p_size","supplier_cnt"});
+    run_q16_impl(db, out);
 }
 
 static void run_q17(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"avg_yearly"});
+    run_q17_impl(db, out);
 }
 
 static void run_q18(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"c_name","c_custkey","o_orderkey","o_orderdate","o_totalprice","sum(l_quantity)"});
+    run_q18_impl(db, out);
 }
 
 static void run_q19(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"revenue"});
+    run_q19_impl(db, out);
 }
 
 static void run_q20(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"s_name","s_address"});
+    run_q20_impl(db, out);
 }
 
 static void run_q21(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"s_name","numwait"});
+    run_q21_impl(db, out);
 }
 
 static void run_q22(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"cntrycode","numcust","totacctbal"});
+    run_q22_impl(db, out);
 }
