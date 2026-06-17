@@ -69,7 +69,12 @@ inline void run_q2_impl(Database* db, std::ostream& out) {
     const int32_t n_ps = db->n_partsupp;
     const int32_t n_supp = db->n_supplier;
 
-    // Pass 1: probe partsupp, accumulate min supplycost per matching part.
+    // Single pass over partsupp: probe the matching-part build side, track the
+    // per-part min supplycost over ASIA suppliers, and stash the few surviving
+    // candidate rows (only ~thousands) for a cheap second filtering pass.
+    struct Cand { int32_t p; int32_t s_idx; int64_t cost; };
+    std::vector<Cand> cands;
+    cands.reserve(16384);
     {
         PROFILE_SCOPE("q2_partsupp_min");
         for (int32_t i = 0; i < n_ps; i++) {
@@ -80,6 +85,7 @@ inline void run_q2_impl(Database* db, std::ostream& out) {
             TRACE_INC(probe_rows);
             int64_t c = ps_cost[i];
             if (c < min_cost[p]) min_cost[p] = c;
+            cands.push_back({p, s_idx, c});
         }
     }
 
@@ -91,17 +97,14 @@ inline void run_q2_impl(Database* db, std::ostream& out) {
     };
 
     std::vector<Result> results;
+    results.reserve(cands.size());
 
-    // Pass 2: emit (part, supplier) rows whose supplycost equals the part minimum.
+    // Emit candidates whose supplycost equals their part's minimum.
     {
         PROFILE_SCOPE("q2_join_probe");
-        for (int32_t i = 0; i < n_ps; i++) {
-            int32_t p = ps_pk[i] - 1;
-            if (!part_match[p]) continue;
-            if (ps_cost[i] != min_cost[p]) continue;
-            int32_t s_idx = ps_sk[i] - 1;
-            if ((uint32_t)s_idx >= (uint32_t)n_supp || !supp_in_asia[s_idx]) continue;
-            results.push_back({db->s_acctbal[s_idx], s_idx, db->s_nationkey[s_idx], p});
+        for (const Cand& cd : cands) {
+            if (cd.cost != min_cost[cd.p]) continue;
+            results.push_back({db->s_acctbal[cd.s_idx], cd.s_idx, db->s_nationkey[cd.s_idx], cd.p});
         }
     }
 
