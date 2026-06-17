@@ -1,6 +1,7 @@
 #pragma once
 #include "builder_impl.hpp"
 #include "query_utils.hpp"
+#include "trace_utils.hpp"
 #include <algorithm>
 #include <sstream>
 #include <fstream>
@@ -32,9 +33,16 @@ static inline std::string q18_days_to_date(int32_t days) {
 static void run_q18(Database* db, const std::string& run_nr) {
     // First pass: compute sum(l_quantity) per orderkey
     std::unordered_map<int32_t, int64_t> order_qty_sum;
-    for (int64_t i = 0; i < db->lineitem_count; i++) {
-        order_qty_sum[db->l_orderkey[i]] += db->l_quantity[i];
+    TRACE_DECL(rows_scanned);
+    {
+        PROFILE_SCOPE("q18_lineitem_agg");
+        for (int64_t i = 0; i < db->lineitem_count; i++) {
+            TRACE_INC(rows_scanned);
+            order_qty_sum[db->l_orderkey[i]] += db->l_quantity[i];
+        }
     }
+    TRACE_COUNT("q18_rows_scanned", rows_scanned);
+    TRACE_COUNT("q18_groups_created", order_qty_sum.size());
 
     // Find orderkeys where sum > 314 (quantity is scale 2, so threshold = 31400)
     std::unordered_set<int32_t> big_orders;
@@ -43,6 +51,7 @@ static void run_q18(Database* db, const std::string& run_nr) {
             big_orders.insert(ok);
         }
     }
+    TRACE_COUNT("q18_big_orders", big_orders.size());
 
     // For qualifying orders, collect results
     struct Result {
@@ -55,27 +64,43 @@ static void run_q18(Database* db, const std::string& run_nr) {
     };
     std::vector<Result> results;
 
-    for (int64_t i = 0; i < db->orders_count; i++) {
-        int32_t ok = db->o_orderkey[i];
-        if (big_orders.count(ok)) {
-            int32_t ck = db->o_custkey[i];
-            results.push_back({
-                db->c_name[ck],
-                ck,
-                ok,
-                db->o_orderdate[i],
-                db->o_totalprice[i],
-                order_qty_sum[ok]
-            });
+    TRACE_DECL(orders_scanned);
+    TRACE_DECL(join_rows_emitted);
+    {
+        PROFILE_SCOPE("q18_orders_probe");
+        for (int64_t i = 0; i < db->orders_count; i++) {
+            TRACE_INC(orders_scanned);
+            int32_t ok = db->o_orderkey[i];
+            if (big_orders.count(ok)) {
+                TRACE_INC(join_rows_emitted);
+                int32_t ck = db->o_custkey[i];
+                results.push_back({
+                    db->c_name[ck],
+                    ck,
+                    ok,
+                    db->o_orderdate[i],
+                    db->o_totalprice[i],
+                    order_qty_sum[ok]
+                });
+            }
         }
     }
+    TRACE_COUNT("q18_orders_scanned", orders_scanned);
+    TRACE_COUNT("q18_join_rows_emitted", join_rows_emitted);
 
-    // Sort by o_totalprice DESC, o_orderdate ASC
-    std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
-        if (a.o_totalprice != b.o_totalprice) return a.o_totalprice > b.o_totalprice;
-        return a.o_orderdate < b.o_orderdate;
-    });
+    {
+        PROFILE_SCOPE("q18_sort");
+        // Sort by o_totalprice DESC, o_orderdate ASC
+        std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
+            if (a.o_totalprice != b.o_totalprice) return a.o_totalprice > b.o_totalprice;
+            return a.o_orderdate < b.o_orderdate;
+        });
+    }
+    TRACE_COUNT("q18_sort_rows_in", results.size());
+    TRACE_COUNT("q18_sort_rows_out", results.size());
 
+    {
+    PROFILE_SCOPE("q18_output");
     std::ostringstream oss;
     write_csv_header(oss, {"c_name","c_custkey","o_orderkey","o_orderdate","o_totalprice","sum(l_quantity)"});
     for (auto& r : results) {
@@ -94,4 +119,7 @@ static void run_q18(Database* db, const std::string& run_nr) {
     out << result;
     out.close();
     std::cout << result;
+    TRACE_COUNT("q18_query_output_rows", results.size());
+    }
+    TRACE_FLUSH();
 }

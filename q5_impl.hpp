@@ -1,6 +1,7 @@
 #pragma once
 #include "builder_impl.hpp"
 #include "query_utils.hpp"
+#include "trace_utils.hpp"
 #include <algorithm>
 #include <sstream>
 #include <fstream>
@@ -40,34 +41,51 @@ static void run_q5(Database* db, const std::string& run_nr) {
     // Qualifying orders: orderdate in range, custkey's nation is in AFRICA
     // Map orderkey -> custkey's nationkey
     std::unordered_map<int32_t, int32_t> order_to_nation; // orderkey -> customer nationkey
-    for (int64_t i = 0; i < db->orders_count; i++) {
-        int32_t od = db->o_orderdate[i];
-        if (od >= date_start && od < date_end) {
-            int32_t ck = db->o_custkey[i];
-            int32_t cnk = db->c_nationkey[ck];
-            if (africa_nations.count(cnk)) {
-                order_to_nation[db->o_orderkey[i]] = cnk;
+    TRACE_DECL(orders_scanned);
+    {
+        PROFILE_SCOPE("q5_orders_build");
+        for (int64_t i = 0; i < db->orders_count; i++) {
+            TRACE_INC(orders_scanned);
+            int32_t od = db->o_orderdate[i];
+            if (od >= date_start && od < date_end) {
+                int32_t ck = db->o_custkey[i];
+                int32_t cnk = db->c_nationkey[ck];
+                if (africa_nations.count(cnk)) {
+                    order_to_nation[db->o_orderkey[i]] = cnk;
+                }
             }
         }
     }
+    TRACE_COUNT("q5_orders_scanned", orders_scanned);
+    TRACE_COUNT("q5_build_rows", order_to_nation.size());
 
     // Scan lineitem: join with qualifying orders, require supplier in same nation as customer
     // revenue per nation
     std::unordered_map<int32_t, int64_t> nation_revenue; // nationkey -> revenue (scale 4)
 
-    for (int64_t i = 0; i < db->lineitem_count; i++) {
-        int32_t ok = db->l_orderkey[i];
-        auto it = order_to_nation.find(ok);
-        if (it != order_to_nation.end()) {
-            int32_t cust_nk = it->second;
-            int32_t sk = db->l_suppkey[i];
-            // c_nationkey = s_nationkey condition
-            if (db->s_nationkey[sk] == cust_nk) {
-                int64_t rev = db->l_extendedprice[i] * (100 - db->l_discount[i]);
-                nation_revenue[cust_nk] += rev;
+    TRACE_DECL(rows_scanned);
+    TRACE_DECL(join_rows_emitted);
+    {
+        PROFILE_SCOPE("q5_lineitem_probe_agg");
+        for (int64_t i = 0; i < db->lineitem_count; i++) {
+            TRACE_INC(rows_scanned);
+            int32_t ok = db->l_orderkey[i];
+            auto it = order_to_nation.find(ok);
+            if (it != order_to_nation.end()) {
+                int32_t cust_nk = it->second;
+                int32_t sk = db->l_suppkey[i];
+                // c_nationkey = s_nationkey condition
+                if (db->s_nationkey[sk] == cust_nk) {
+                    TRACE_INC(join_rows_emitted);
+                    int64_t rev = db->l_extendedprice[i] * (100 - db->l_discount[i]);
+                    nation_revenue[cust_nk] += rev;
+                }
             }
         }
     }
+    TRACE_COUNT("q5_rows_scanned", rows_scanned);
+    TRACE_COUNT("q5_join_rows_emitted", join_rows_emitted);
+    TRACE_COUNT("q5_groups_created", nation_revenue.size());
 
     // Collect and sort by revenue desc
     struct Result { std::string name; int64_t revenue; };
@@ -75,10 +93,17 @@ static void run_q5(Database* db, const std::string& run_nr) {
     for (auto& [nk, rev] : nation_revenue) {
         results.push_back({db->nationkey_to_name[nk], rev});
     }
-    std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
-        return a.revenue > b.revenue;
-    });
+    {
+        PROFILE_SCOPE("q5_sort");
+        std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
+            return a.revenue > b.revenue;
+        });
+    }
+    TRACE_COUNT("q5_sort_rows_in", results.size());
+    TRACE_COUNT("q5_sort_rows_out", results.size());
 
+    {
+    PROFILE_SCOPE("q5_output");
     std::ostringstream oss;
     write_csv_header(oss, {"n_name","revenue"});
     for (auto& r : results) {
@@ -93,4 +118,7 @@ static void run_q5(Database* db, const std::string& run_nr) {
     out << result;
     out.close();
     std::cout << result;
+    TRACE_COUNT("q5_query_output_rows", results.size());
+    }
+    TRACE_FLUSH();
 }

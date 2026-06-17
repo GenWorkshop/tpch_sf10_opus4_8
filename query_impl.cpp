@@ -14,6 +14,7 @@
 
 #include "args_parser.hpp"
 #include "query_utils.hpp"
+#include "cpu_affinity.hpp"
 #include "q1_impl.hpp"
 #include "q2_impl.hpp"
 #include "q3_impl.hpp"
@@ -77,6 +78,8 @@ void query(Database* db) {
         requests.push_back(QueryRequest{query_id, line});
     }
 
+    pin_process_to_cpu(3);
+
     int run_nr = 0;
     for (auto& req : requests) {
         run_nr++;
@@ -109,6 +112,8 @@ void query(Database* db) {
             std::cerr << "Unknown query: " << req.id << std::endl;
         }
     }
+
+    unpin_process_from_cpus();
 }
 
 // Helper: write content to both file and stdout

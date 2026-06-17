@@ -1,6 +1,7 @@
 #pragma once
 #include "builder_impl.hpp"
 #include "query_utils.hpp"
+#include "trace_utils.hpp"
 #include <algorithm>
 #include <sstream>
 #include <fstream>
@@ -29,24 +30,41 @@ static void run_q10(Database* db, const std::string& run_nr) {
 
     // Qualifying orders: orderdate in range -> map orderkey -> custkey
     std::unordered_map<int32_t, int32_t> order_to_cust;
-    for (int64_t i = 0; i < db->orders_count; i++) {
-        int32_t od = db->o_orderdate[i];
-        if (od >= date_start && od < date_end) {
-            order_to_cust[db->o_orderkey[i]] = db->o_custkey[i];
+    TRACE_DECL(orders_scanned);
+    {
+        PROFILE_SCOPE("q10_orders_build");
+        for (int64_t i = 0; i < db->orders_count; i++) {
+            TRACE_INC(orders_scanned);
+            int32_t od = db->o_orderdate[i];
+            if (od >= date_start && od < date_end) {
+                order_to_cust[db->o_orderkey[i]] = db->o_custkey[i];
+            }
         }
     }
+    TRACE_COUNT("q10_orders_scanned", orders_scanned);
+    TRACE_COUNT("q10_build_rows", order_to_cust.size());
 
     // Scan lineitem: returnflag='R', orderkey in qualifying orders
     // Group by custkey -> revenue
     std::unordered_map<int32_t, int64_t> cust_revenue;
-    for (int64_t i = 0; i < db->lineitem_count; i++) {
-        if (db->l_returnflag[i] != 'R') continue;
-        int32_t ok = db->l_orderkey[i];
-        auto it = order_to_cust.find(ok);
-        if (it == order_to_cust.end()) continue;
-        int64_t rev = db->l_extendedprice[i] * (100 - db->l_discount[i]);
-        cust_revenue[it->second] += rev;
+    TRACE_DECL(rows_scanned);
+    TRACE_DECL(join_rows_emitted);
+    {
+        PROFILE_SCOPE("q10_lineitem_probe_agg");
+        for (int64_t i = 0; i < db->lineitem_count; i++) {
+            TRACE_INC(rows_scanned);
+            if (db->l_returnflag[i] != 'R') continue;
+            int32_t ok = db->l_orderkey[i];
+            auto it = order_to_cust.find(ok);
+            if (it == order_to_cust.end()) continue;
+            TRACE_INC(join_rows_emitted);
+            int64_t rev = db->l_extendedprice[i] * (100 - db->l_discount[i]);
+            cust_revenue[it->second] += rev;
+        }
     }
+    TRACE_COUNT("q10_rows_scanned", rows_scanned);
+    TRACE_COUNT("q10_join_rows_emitted", join_rows_emitted);
+    TRACE_COUNT("q10_groups_created", cust_revenue.size());
 
     // Collect results
     struct Result {
@@ -59,11 +77,18 @@ static void run_q10(Database* db, const std::string& run_nr) {
         results.push_back({ck, rev});
     }
 
-    // Sort by revenue DESC
-    std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
-        return a.revenue > b.revenue;
-    });
+    {
+        PROFILE_SCOPE("q10_sort");
+        // Sort by revenue DESC
+        std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
+            return a.revenue > b.revenue;
+        });
+    }
+    TRACE_COUNT("q10_sort_rows_in", results.size());
+    TRACE_COUNT("q10_sort_rows_out", results.size());
 
+    {
+    PROFILE_SCOPE("q10_output");
     std::ostringstream oss;
     write_csv_header(oss, {"c_custkey","c_name","revenue","c_acctbal","n_name","c_address","c_phone","c_comment"});
     for (auto& r : results) {
@@ -85,4 +110,7 @@ static void run_q10(Database* db, const std::string& run_nr) {
     out << result;
     out.close();
     std::cout << result;
+    TRACE_COUNT("q10_query_output_rows", results.size());
+    }
+    TRACE_FLUSH();
 }

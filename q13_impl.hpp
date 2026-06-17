@@ -1,6 +1,7 @@
 #pragma once
 #include "builder_impl.hpp"
 #include "query_utils.hpp"
+#include "trace_utils.hpp"
 #include <algorithm>
 #include <sstream>
 #include <fstream>
@@ -19,28 +20,44 @@ static void run_q13(Database* db, const std::string& run_nr) {
     int32_t max_custkey = (int32_t)db->c_name.size() - 1;
     std::vector<int32_t> cust_order_count(max_custkey + 1, 0);
 
-    for (int64_t i = 0; i < db->orders_count; i++) {
-        const std::string& comment = db->o_comment[i];
-        // NOT LIKE '%express%requests%'
-        auto pos1 = comment.find("express");
-        if (pos1 != std::string::npos) {
-            auto pos2 = comment.find("requests", pos1 + 7);
-            if (pos2 != std::string::npos) {
-                continue; // exclude this order
+    TRACE_DECL(orders_scanned);
+    TRACE_DECL(orders_emitted);
+    {
+        PROFILE_SCOPE("q13_orders_scan_agg");
+        for (int64_t i = 0; i < db->orders_count; i++) {
+            TRACE_INC(orders_scanned);
+            const std::string& comment = db->o_comment[i];
+            // NOT LIKE '%express%requests%'
+            auto pos1 = comment.find("express");
+            if (pos1 != std::string::npos) {
+                auto pos2 = comment.find("requests", pos1 + 7);
+                if (pos2 != std::string::npos) {
+                    continue; // exclude this order
+                }
             }
+            TRACE_INC(orders_emitted);
+            int32_t ck = db->o_custkey[i];
+            cust_order_count[ck]++;
         }
-        int32_t ck = db->o_custkey[i];
-        cust_order_count[ck]++;
     }
+    TRACE_COUNT("q13_orders_scanned", orders_scanned);
+    TRACE_COUNT("q13_orders_emitted", orders_emitted);
 
     // Count distribution: c_count -> number of customers with that count
     std::unordered_map<int32_t, int64_t> dist;
-    for (int32_t ck = 1; ck <= max_custkey; ck++) {
-        // Only count valid customers (those that exist in the data)
-        if (!db->c_name[ck].empty()) {
-            dist[cust_order_count[ck]]++;
+    TRACE_DECL(cust_rows_in);
+    {
+        PROFILE_SCOPE("q13_cust_dist_agg");
+        for (int32_t ck = 1; ck <= max_custkey; ck++) {
+            // Only count valid customers (those that exist in the data)
+            if (!db->c_name[ck].empty()) {
+                TRACE_INC(cust_rows_in);
+                dist[cust_order_count[ck]]++;
+            }
         }
     }
+    TRACE_COUNT("q13_cust_rows_in", cust_rows_in);
+    TRACE_COUNT("q13_groups_created", dist.size());
 
     // Collect and sort by custdist DESC, c_count DESC
     struct Result { int32_t c_count; int64_t custdist; };
@@ -48,11 +65,18 @@ static void run_q13(Database* db, const std::string& run_nr) {
     for (auto& [cnt, cdist] : dist) {
         results.push_back({cnt, cdist});
     }
-    std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
-        if (a.custdist != b.custdist) return a.custdist > b.custdist;
-        return a.c_count > b.c_count;
-    });
+    {
+        PROFILE_SCOPE("q13_sort");
+        std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
+            if (a.custdist != b.custdist) return a.custdist > b.custdist;
+            return a.c_count > b.c_count;
+        });
+    }
+    TRACE_COUNT("q13_sort_rows_in", results.size());
+    TRACE_COUNT("q13_sort_rows_out", results.size());
 
+    {
+    PROFILE_SCOPE("q13_output");
     std::ostringstream oss;
     write_csv_header(oss, {"c_count","custdist"});
     for (auto& r : results) {
@@ -67,4 +91,7 @@ static void run_q13(Database* db, const std::string& run_nr) {
     out << result;
     out.close();
     std::cout << result;
+    TRACE_COUNT("q13_query_output_rows", results.size());
+    }
+    TRACE_FLUSH();
 }

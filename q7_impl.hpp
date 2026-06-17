@@ -1,6 +1,7 @@
 #pragma once
 #include "builder_impl.hpp"
 #include "query_utils.hpp"
+#include "trace_utils.hpp"
 #include <algorithm>
 #include <sstream>
 #include <fstream>
@@ -48,13 +49,20 @@ static void run_q7(Database* db, const std::string& run_nr) {
 
     // Build orderkey -> customer nationkey map
     std::unordered_map<int32_t, int32_t> order_to_cust_nk;
-    for (int64_t i = 0; i < db->orders_count; i++) {
-        int32_t ck = db->o_custkey[i];
-        int32_t cnk = db->c_nationkey[ck];
-        if (cnk == algeria_nk || cnk == brazil_nk) {
-            order_to_cust_nk[db->o_orderkey[i]] = cnk;
+    TRACE_DECL(orders_scanned);
+    {
+        PROFILE_SCOPE("q7_orders_build");
+        for (int64_t i = 0; i < db->orders_count; i++) {
+            TRACE_INC(orders_scanned);
+            int32_t ck = db->o_custkey[i];
+            int32_t cnk = db->c_nationkey[ck];
+            if (cnk == algeria_nk || cnk == brazil_nk) {
+                order_to_cust_nk[db->o_orderkey[i]] = cnk;
+            }
         }
     }
+    TRACE_COUNT("q7_orders_scanned", orders_scanned);
+    TRACE_COUNT("q7_build_rows", order_to_cust_nk.size());
 
     // Group key: (supp_nation_name, cust_nation_name, year)
     struct Key {
@@ -70,30 +78,42 @@ static void run_q7(Database* db, const std::string& run_nr) {
     std::map<Key, int64_t> groups;
 
     // Scan lineitem
-    for (int64_t i = 0; i < db->lineitem_count; i++) {
-        int32_t sd = db->l_shipdate[i];
-        if (sd < date_start || sd > date_end) continue;
+    TRACE_DECL(rows_scanned);
+    TRACE_DECL(join_rows_emitted);
+    {
+        PROFILE_SCOPE("q7_lineitem_probe_agg");
+        for (int64_t i = 0; i < db->lineitem_count; i++) {
+            TRACE_INC(rows_scanned);
+            int32_t sd = db->l_shipdate[i];
+            if (sd < date_start || sd > date_end) continue;
 
-        int32_t sk = db->l_suppkey[i];
-        int32_t s_nk = db->s_nationkey[sk];
-        if (s_nk != algeria_nk && s_nk != brazil_nk) continue;
+            int32_t sk = db->l_suppkey[i];
+            int32_t s_nk = db->s_nationkey[sk];
+            if (s_nk != algeria_nk && s_nk != brazil_nk) continue;
 
-        int32_t ok = db->l_orderkey[i];
-        auto it = order_to_cust_nk.find(ok);
-        if (it == order_to_cust_nk.end()) continue;
-        int32_t c_nk = it->second;
+            int32_t ok = db->l_orderkey[i];
+            auto it = order_to_cust_nk.find(ok);
+            if (it == order_to_cust_nk.end()) continue;
+            int32_t c_nk = it->second;
 
-        // Check valid pair: (ALGERIA,BRAZIL) or (BRAZIL,ALGERIA)
-        if (!((s_nk == algeria_nk && c_nk == brazil_nk) ||
-              (s_nk == brazil_nk && c_nk == algeria_nk))) continue;
+            // Check valid pair: (ALGERIA,BRAZIL) or (BRAZIL,ALGERIA)
+            if (!((s_nk == algeria_nk && c_nk == brazil_nk) ||
+                  (s_nk == brazil_nk && c_nk == algeria_nk))) continue;
+            TRACE_INC(join_rows_emitted);
 
-        int year = days_to_year(sd);
-        int64_t volume = db->l_extendedprice[i] * (100 - db->l_discount[i]);
+            int year = days_to_year(sd);
+            int64_t volume = db->l_extendedprice[i] * (100 - db->l_discount[i]);
 
-        Key key{db->nationkey_to_name[s_nk], db->nationkey_to_name[c_nk], year};
-        groups[key] += volume;
+            Key key{db->nationkey_to_name[s_nk], db->nationkey_to_name[c_nk], year};
+            groups[key] += volume;
+        }
     }
+    TRACE_COUNT("q7_rows_scanned", rows_scanned);
+    TRACE_COUNT("q7_join_rows_emitted", join_rows_emitted);
+    TRACE_COUNT("q7_groups_created", groups.size());
 
+    {
+    PROFILE_SCOPE("q7_output");
     std::ostringstream oss;
     write_csv_header(oss, {"supp_nation","cust_nation","l_year","revenue"});
     for (auto& [key, rev] : groups) {
@@ -110,4 +130,7 @@ static void run_q7(Database* db, const std::string& run_nr) {
     out << result;
     out.close();
     std::cout << result;
+    TRACE_COUNT("q7_query_output_rows", groups.size());
+    }
+    TRACE_FLUSH();
 }

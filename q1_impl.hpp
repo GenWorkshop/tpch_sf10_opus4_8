@@ -1,6 +1,7 @@
 #pragma once
 #include "builder_impl.hpp"
 #include "query_utils.hpp"
+#include "trace_utils.hpp"
 #include <algorithm>
 #include <sstream>
 #include <map>
@@ -37,9 +38,15 @@ static void run_q1(Database* db, const std::string& run_nr) {
     // Use ordered map with key = (returnflag, linestatus) for sorted output
     std::map<std::pair<char,char>, Agg> groups;
 
-    for (int64_t i = 0; i < db->lineitem_count; i++) {
-        if (db->l_shipdate[i] <= max_shipdate) {
-            char rf = db->l_returnflag[i];
+    TRACE_DECL(rows_scanned);
+    TRACE_DECL(rows_emitted);
+    {
+        PROFILE_SCOPE("q1_scan_agg");
+        for (int64_t i = 0; i < db->lineitem_count; i++) {
+            TRACE_INC(rows_scanned);
+            if (db->l_shipdate[i] <= max_shipdate) {
+                TRACE_INC(rows_emitted);
+                char rf = db->l_returnflag[i];
             char ls = db->l_linestatus[i];
             auto& agg = groups[{rf, ls}];
 
@@ -66,7 +73,15 @@ static void run_q1(Database* db, const std::string& run_nr) {
             agg.count++;
         }
     }
+    }
+    TRACE_COUNT("q1_rows_scanned", rows_scanned);
+    TRACE_COUNT("q1_rows_emitted", rows_emitted);
+    TRACE_COUNT("q1_agg_rows_in", rows_emitted);
+    TRACE_COUNT("q1_groups_created", groups.size());
+    TRACE_COUNT("q1_agg_rows_emitted", groups.size());
 
+    {
+    PROFILE_SCOPE("q1_output");
     std::ostringstream oss;
     write_csv_header(oss, {"l_returnflag","l_linestatus","sum_qty","sum_base_price",
                            "sum_disc_price","sum_charge","avg_qty","avg_price","avg_disc","count_order"});
@@ -109,4 +124,7 @@ static void run_q1(Database* db, const std::string& run_nr) {
     out << result;
     out.close();
     std::cout << result;
+    TRACE_COUNT("q1_query_output_rows", groups.size());
+    }
+    TRACE_FLUSH();
 }

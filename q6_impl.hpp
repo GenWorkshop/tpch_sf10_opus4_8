@@ -1,6 +1,7 @@
 #pragma once
 #include "builder_impl.hpp"
 #include "query_utils.hpp"
+#include "trace_utils.hpp"
 #include <sstream>
 #include <fstream>
 
@@ -27,20 +28,31 @@ static void run_q6(Database* db, const std::string& run_nr) {
     const int64_t qty_max = 2400;
 
     __int128 revenue = 0; // scale 4
-    for (int64_t i = 0; i < db->lineitem_count; i++) {
-        int32_t sd = db->l_shipdate[i];
-        if (sd >= date_start && sd < date_end) {
-            int64_t disc = db->l_discount[i];
-            if (disc >= disc_lo && disc <= disc_hi) {
-                if (db->l_quantity[i] < qty_max) {
-                    revenue += (__int128)db->l_extendedprice[i] * disc;
+    TRACE_DECL(rows_scanned);
+    TRACE_DECL(rows_emitted);
+    {
+        PROFILE_SCOPE("q6_scan");
+        for (int64_t i = 0; i < db->lineitem_count; i++) {
+            TRACE_INC(rows_scanned);
+            int32_t sd = db->l_shipdate[i];
+            if (sd >= date_start && sd < date_end) {
+                int64_t disc = db->l_discount[i];
+                if (disc >= disc_lo && disc <= disc_hi) {
+                    if (db->l_quantity[i] < qty_max) {
+                        TRACE_INC(rows_emitted);
+                        revenue += (__int128)db->l_extendedprice[i] * disc;
+                    }
                 }
             }
         }
     }
+    TRACE_COUNT("q6_rows_scanned", rows_scanned);
+    TRACE_COUNT("q6_rows_emitted", rows_emitted);
 
     double rev_d = static_cast<double>(static_cast<long long>(revenue)) / 10000.0;
 
+    {
+    PROFILE_SCOPE("q6_output");
     std::ostringstream oss;
     write_csv_header(oss, {"revenue"});
     write_csv_row(oss, {fmt_decimal(rev_d, 4)});
@@ -50,4 +62,7 @@ static void run_q6(Database* db, const std::string& run_nr) {
     out << result;
     out.close();
     std::cout << result;
+    TRACE_COUNT("q6_query_output_rows", 1);
+    }
+    TRACE_FLUSH();
 }

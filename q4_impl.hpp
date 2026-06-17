@@ -1,6 +1,7 @@
 #pragma once
 #include "builder_impl.hpp"
 #include "query_utils.hpp"
+#include "trace_utils.hpp"
 #include <algorithm>
 #include <sstream>
 #include <fstream>
@@ -27,23 +28,42 @@ static void run_q4(Database* db, const std::string& run_nr) {
 
     // Build set of orderkeys that have at least one lineitem with commitdate < receiptdate
     std::unordered_set<int32_t> late_orderkeys;
-    for (int64_t i = 0; i < db->lineitem_count; i++) {
-        if (db->l_commitdate[i] < db->l_receiptdate[i]) {
-            late_orderkeys.insert(db->l_orderkey[i]);
-        }
-    }
-
-    // Scan orders in date range with EXISTS condition
-    std::map<std::string, int64_t> counts;
-    for (int64_t i = 0; i < db->orders_count; i++) {
-        int32_t od = db->o_orderdate[i];
-        if (od >= date_start && od < date_end) {
-            if (late_orderkeys.count(db->o_orderkey[i])) {
-                counts[db->o_orderpriority[i]]++;
+    TRACE_DECL(build_rows_in);
+    {
+        PROFILE_SCOPE("q4_semijoin_build");
+        for (int64_t i = 0; i < db->lineitem_count; i++) {
+            TRACE_INC(build_rows_in);
+            if (db->l_commitdate[i] < db->l_receiptdate[i]) {
+                late_orderkeys.insert(db->l_orderkey[i]);
             }
         }
     }
+    TRACE_COUNT("q4_build_rows_in", build_rows_in);
+    TRACE_COUNT("q4_build_rows", late_orderkeys.size());
 
+    // Scan orders in date range with EXISTS condition
+    std::map<std::string, int64_t> counts;
+    TRACE_DECL(probe_rows_in);
+    TRACE_DECL(join_rows_emitted);
+    {
+        PROFILE_SCOPE("q4_scan_probe_agg");
+        for (int64_t i = 0; i < db->orders_count; i++) {
+            TRACE_INC(probe_rows_in);
+            int32_t od = db->o_orderdate[i];
+            if (od >= date_start && od < date_end) {
+                if (late_orderkeys.count(db->o_orderkey[i])) {
+                    TRACE_INC(join_rows_emitted);
+                    counts[db->o_orderpriority[i]]++;
+                }
+            }
+        }
+    }
+    TRACE_COUNT("q4_probe_rows_in", probe_rows_in);
+    TRACE_COUNT("q4_join_rows_emitted", join_rows_emitted);
+    TRACE_COUNT("q4_groups_created", counts.size());
+
+    {
+    PROFILE_SCOPE("q4_output");
     std::ostringstream oss;
     write_csv_header(oss, {"o_orderpriority","order_count"});
     for (auto& [prio, cnt] : counts) {
@@ -55,4 +75,7 @@ static void run_q4(Database* db, const std::string& run_nr) {
     out << result;
     out.close();
     std::cout << result;
+    TRACE_COUNT("q4_query_output_rows", counts.size());
+    }
+    TRACE_FLUSH();
 }

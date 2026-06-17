@@ -1,6 +1,7 @@
 #pragma once
 #include "builder_impl.hpp"
 #include "query_utils.hpp"
+#include "trace_utils.hpp"
 #include <algorithm>
 #include <sstream>
 #include <fstream>
@@ -33,12 +34,22 @@ static void run_q11(Database* db, const std::string& run_nr) {
     std::unordered_map<int32_t, int64_t> partkey_value;
     int64_t total_value = 0;
 
-    for (int64_t i = 0; i < db->partsupp_count; i++) {
-        if (!russia_supps.count(db->ps_suppkey[i])) continue;
-        int64_t val = db->ps_supplycost[i] * (int64_t)db->ps_availqty[i];
-        partkey_value[db->ps_partkey[i]] += val;
-        total_value += val;
+    TRACE_DECL(rows_scanned);
+    TRACE_DECL(rows_emitted);
+    {
+        PROFILE_SCOPE("q11_partsupp_scan_agg");
+        for (int64_t i = 0; i < db->partsupp_count; i++) {
+            TRACE_INC(rows_scanned);
+            if (!russia_supps.count(db->ps_suppkey[i])) continue;
+            TRACE_INC(rows_emitted);
+            int64_t val = db->ps_supplycost[i] * (int64_t)db->ps_availqty[i];
+            partkey_value[db->ps_partkey[i]] += val;
+            total_value += val;
+        }
     }
+    TRACE_COUNT("q11_rows_scanned", rows_scanned);
+    TRACE_COUNT("q11_rows_emitted", rows_emitted);
+    TRACE_COUNT("q11_groups_created", partkey_value.size());
 
     // Threshold = total_value * 0.0001
     double threshold = total_value * 0.0001;
@@ -52,11 +63,18 @@ static void run_q11(Database* db, const std::string& run_nr) {
         }
     }
 
-    // Sort by value DESC
-    std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
-        return a.value > b.value;
-    });
+    {
+        PROFILE_SCOPE("q11_sort");
+        // Sort by value DESC
+        std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
+            return a.value > b.value;
+        });
+    }
+    TRACE_COUNT("q11_sort_rows_in", results.size());
+    TRACE_COUNT("q11_sort_rows_out", results.size());
 
+    {
+    PROFILE_SCOPE("q11_output");
     std::ostringstream oss;
     write_csv_header(oss, {"ps_partkey","value"});
     for (auto& r : results) {
@@ -71,4 +89,7 @@ static void run_q11(Database* db, const std::string& run_nr) {
     out << result;
     out.close();
     std::cout << result;
+    TRACE_COUNT("q11_query_output_rows", results.size());
+    }
+    TRACE_FLUSH();
 }

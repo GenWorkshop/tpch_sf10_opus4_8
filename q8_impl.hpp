@@ -1,6 +1,7 @@
 #pragma once
 #include "builder_impl.hpp"
 #include "query_utils.hpp"
+#include "trace_utils.hpp"
 #include <algorithm>
 #include <sstream>
 #include <fstream>
@@ -63,16 +64,23 @@ static void run_q8(Database* db, const std::string& run_nr) {
     // Qualifying orders: orderdate in [1995-01-01, 1996-12-31], customer in AMERICA
     // Map orderkey -> (year)
     std::unordered_map<int32_t, int> order_to_year;
-    for (int64_t i = 0; i < db->orders_count; i++) {
-        int32_t od = db->o_orderdate[i];
-        if (od >= date_start && od <= date_end) {
-            int32_t ck = db->o_custkey[i];
-            int32_t cnk = db->c_nationkey[ck];
-            if (america_nations.count(cnk)) {
-                order_to_year[db->o_orderkey[i]] = days_to_year(od);
+    TRACE_DECL(orders_scanned);
+    {
+        PROFILE_SCOPE("q8_orders_build");
+        for (int64_t i = 0; i < db->orders_count; i++) {
+            TRACE_INC(orders_scanned);
+            int32_t od = db->o_orderdate[i];
+            if (od >= date_start && od <= date_end) {
+                int32_t ck = db->o_custkey[i];
+                int32_t cnk = db->c_nationkey[ck];
+                if (america_nations.count(cnk)) {
+                    order_to_year[db->o_orderkey[i]] = days_to_year(od);
+                }
             }
         }
     }
+    TRACE_COUNT("q8_orders_scanned", orders_scanned);
+    TRACE_COUNT("q8_build_rows", order_to_year.size());
 
     // Scan lineitem: partkey in matching_parts, orderkey in qualifying orders
     // volume = extendedprice * (1 - discount) (scale 4)
@@ -80,23 +88,35 @@ static void run_q8(Database* db, const std::string& run_nr) {
     struct YearAgg { int64_t france_vol = 0; int64_t total_vol = 0; };
     std::map<int, YearAgg> groups;
 
-    for (int64_t i = 0; i < db->lineitem_count; i++) {
-        if (!matching_parts.count(db->l_partkey[i])) continue;
-        int32_t ok = db->l_orderkey[i];
-        auto it = order_to_year.find(ok);
-        if (it == order_to_year.end()) continue;
+    TRACE_DECL(rows_scanned);
+    TRACE_DECL(join_rows_emitted);
+    {
+        PROFILE_SCOPE("q8_lineitem_probe_agg");
+        for (int64_t i = 0; i < db->lineitem_count; i++) {
+            TRACE_INC(rows_scanned);
+            if (!matching_parts.count(db->l_partkey[i])) continue;
+            int32_t ok = db->l_orderkey[i];
+            auto it = order_to_year.find(ok);
+            if (it == order_to_year.end()) continue;
+            TRACE_INC(join_rows_emitted);
 
-        int64_t volume = db->l_extendedprice[i] * (100 - db->l_discount[i]);
-        int year = it->second;
-        groups[year].total_vol += volume;
+            int64_t volume = db->l_extendedprice[i] * (100 - db->l_discount[i]);
+            int year = it->second;
+            groups[year].total_vol += volume;
 
-        // Check if supplier nation is FRANCE
-        int32_t sk = db->l_suppkey[i];
-        if (db->s_nationkey[sk] == france_nk) {
-            groups[year].france_vol += volume;
+            // Check if supplier nation is FRANCE
+            int32_t sk = db->l_suppkey[i];
+            if (db->s_nationkey[sk] == france_nk) {
+                groups[year].france_vol += volume;
+            }
         }
     }
+    TRACE_COUNT("q8_rows_scanned", rows_scanned);
+    TRACE_COUNT("q8_join_rows_emitted", join_rows_emitted);
+    TRACE_COUNT("q8_groups_created", groups.size());
 
+    {
+    PROFILE_SCOPE("q8_output");
     std::ostringstream oss;
     write_csv_header(oss, {"o_year","mkt_share"});
     for (auto& [year, agg] : groups) {
@@ -113,4 +133,7 @@ static void run_q8(Database* db, const std::string& run_nr) {
     out << result;
     out.close();
     std::cout << result;
+    TRACE_COUNT("q8_query_output_rows", groups.size());
+    }
+    TRACE_FLUSH();
 }

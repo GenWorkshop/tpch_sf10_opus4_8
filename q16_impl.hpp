@@ -1,6 +1,7 @@
 #pragma once
 #include "builder_impl.hpp"
 #include "query_utils.hpp"
+#include "trace_utils.hpp"
 #include <algorithm>
 #include <sstream>
 #include <fstream>
@@ -34,21 +35,31 @@ static void run_q16(Database* db, const std::string& run_nr) {
     std::map<Key, std::set<int32_t>> groups;
 
     // Scan partsupp
-    for (int64_t i = 0; i < db->partsupp_count; i++) {
-        int32_t sk = db->ps_suppkey[i];
-        // Exclude complaint suppliers
-        if (db->complaint_suppliers.count(sk)) continue;
+    TRACE_DECL(rows_scanned);
+    TRACE_DECL(rows_emitted);
+    {
+        PROFILE_SCOPE("q16_partsupp_scan_join_agg");
+        for (int64_t i = 0; i < db->partsupp_count; i++) {
+            TRACE_INC(rows_scanned);
+            int32_t sk = db->ps_suppkey[i];
+            // Exclude complaint suppliers
+            if (db->complaint_suppliers.count(sk)) continue;
 
-        int32_t pk = db->ps_partkey[i];
-        // Part filters
-        if (db->p_brand[pk] == "Brand#31") continue;
-        const std::string& ptype = db->p_type[pk];
-        if (ptype.size() >= 14 && ptype.substr(0, 14) == "SMALL POLISHED") continue;
-        if (!valid_sizes.count(db->p_size[pk])) continue;
+            int32_t pk = db->ps_partkey[i];
+            // Part filters
+            if (db->p_brand[pk] == "Brand#31") continue;
+            const std::string& ptype = db->p_type[pk];
+            if (ptype.size() >= 14 && ptype.substr(0, 14) == "SMALL POLISHED") continue;
+            if (!valid_sizes.count(db->p_size[pk])) continue;
+            TRACE_INC(rows_emitted);
 
-        Key key{db->p_brand[pk], ptype, db->p_size[pk]};
-        groups[key].insert(sk);
+            Key key{db->p_brand[pk], ptype, db->p_size[pk]};
+            groups[key].insert(sk);
+        }
     }
+    TRACE_COUNT("q16_rows_scanned", rows_scanned);
+    TRACE_COUNT("q16_rows_emitted", rows_emitted);
+    TRACE_COUNT("q16_groups_created", groups.size());
 
     // Collect results
     struct Result {
@@ -63,14 +74,21 @@ static void run_q16(Database* db, const std::string& run_nr) {
         results.push_back({key.brand, key.type, key.size, (int64_t)supps.size()});
     }
 
-    // Sort by supplier_cnt DESC, brand, type, size
-    std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
-        if (a.supplier_cnt != b.supplier_cnt) return a.supplier_cnt > b.supplier_cnt;
-        if (a.brand != b.brand) return a.brand < b.brand;
-        if (a.type != b.type) return a.type < b.type;
-        return a.size < b.size;
-    });
+    {
+        PROFILE_SCOPE("q16_sort");
+        // Sort by supplier_cnt DESC, brand, type, size
+        std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
+            if (a.supplier_cnt != b.supplier_cnt) return a.supplier_cnt > b.supplier_cnt;
+            if (a.brand != b.brand) return a.brand < b.brand;
+            if (a.type != b.type) return a.type < b.type;
+            return a.size < b.size;
+        });
+    }
+    TRACE_COUNT("q16_sort_rows_in", results.size());
+    TRACE_COUNT("q16_sort_rows_out", results.size());
 
+    {
+    PROFILE_SCOPE("q16_output");
     std::ostringstream oss;
     write_csv_header(oss, {"p_brand","p_type","p_size","supplier_cnt"});
     for (auto& r : results) {
@@ -87,4 +105,7 @@ static void run_q16(Database* db, const std::string& run_nr) {
     out << result;
     out.close();
     std::cout << result;
+    TRACE_COUNT("q16_query_output_rows", results.size());
+    }
+    TRACE_FLUSH();
 }

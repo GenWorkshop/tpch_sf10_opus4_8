@@ -1,6 +1,7 @@
 #pragma once
 #include "builder_impl.hpp"
 #include "query_utils.hpp"
+#include "trace_utils.hpp"
 #include <algorithm>
 #include <sstream>
 #include <fstream>
@@ -43,39 +44,57 @@ static void run_q20(Database* db, const std::string& run_nr) {
     // Compute sum(l_quantity) per (partkey, suppkey) for qualifying date range and parts
     // Key: partkey * 1000000 + suppkey
     std::unordered_map<int64_t, int64_t> ps_qty_sum;
-    for (int64_t i = 0; i < db->lineitem_count; i++) {
-        int32_t sd = db->l_shipdate[i];
-        if (sd >= date_start && sd < date_end) {
-            int32_t pk = db->l_partkey[i];
-            if (linen_parts.count(pk)) {
-                int64_t key = (int64_t)pk * 1000000LL + db->l_suppkey[i];
-                ps_qty_sum[key] += db->l_quantity[i];
+    TRACE_DECL(rows_scanned);
+    TRACE_DECL(rows_emitted);
+    {
+        PROFILE_SCOPE("q20_lineitem_agg");
+        for (int64_t i = 0; i < db->lineitem_count; i++) {
+            TRACE_INC(rows_scanned);
+            int32_t sd = db->l_shipdate[i];
+            if (sd >= date_start && sd < date_end) {
+                int32_t pk = db->l_partkey[i];
+                if (linen_parts.count(pk)) {
+                    TRACE_INC(rows_emitted);
+                    int64_t key = (int64_t)pk * 1000000LL + db->l_suppkey[i];
+                    ps_qty_sum[key] += db->l_quantity[i];
+                }
             }
         }
     }
+    TRACE_COUNT("q20_linen_parts", linen_parts.size());
+    TRACE_COUNT("q20_rows_scanned", rows_scanned);
+    TRACE_COUNT("q20_rows_emitted", rows_emitted);
+    TRACE_COUNT("q20_groups_created", ps_qty_sum.size());
 
     // Find qualifying suppkeys from partsupp
     // ps_availqty > 0.5 * sum(l_quantity) for that (partkey, suppkey)
     std::unordered_set<int32_t> qualifying_supps;
-    for (int64_t i = 0; i < db->partsupp_count; i++) {
-        int32_t pk = db->ps_partkey[i];
-        if (!linen_parts.count(pk)) continue;
-        int32_t sk = db->ps_suppkey[i];
-        int64_t key = (int64_t)pk * 1000000LL + sk;
-        auto it = ps_qty_sum.find(key);
-        // ps_availqty is integer, sum is scale 2
-        // Condition: ps_availqty > 0.5 * sum(l_quantity)
-        // ps_availqty (raw int) vs 0.5 * sum (scale 2)
-        // Convert: ps_availqty * 100 (to scale 2) > 0.5 * sum
-        // Or: ps_availqty * 200 > sum
-        // If no matching lineitems, the SQL subquery returns NULL -> comparison is FALSE
-        if (it == ps_qty_sum.end()) continue;
-        int64_t avail_scaled = (int64_t)db->ps_availqty[i] * 200; // scale 2 * 2
-        int64_t sum_qty = it->second;
-        if (avail_scaled > sum_qty) {
-            qualifying_supps.insert(sk);
+    TRACE_DECL(ps_scanned);
+    {
+        PROFILE_SCOPE("q20_partsupp_probe");
+        for (int64_t i = 0; i < db->partsupp_count; i++) {
+            TRACE_INC(ps_scanned);
+            int32_t pk = db->ps_partkey[i];
+            if (!linen_parts.count(pk)) continue;
+            int32_t sk = db->ps_suppkey[i];
+            int64_t key = (int64_t)pk * 1000000LL + sk;
+            auto it = ps_qty_sum.find(key);
+            // ps_availqty is integer, sum is scale 2
+            // Condition: ps_availqty > 0.5 * sum(l_quantity)
+            // ps_availqty (raw int) vs 0.5 * sum (scale 2)
+            // Convert: ps_availqty * 100 (to scale 2) > 0.5 * sum
+            // Or: ps_availqty * 200 > sum
+            // If no matching lineitems, the SQL subquery returns NULL -> comparison is FALSE
+            if (it == ps_qty_sum.end()) continue;
+            int64_t avail_scaled = (int64_t)db->ps_availqty[i] * 200; // scale 2 * 2
+            int64_t sum_qty = it->second;
+            if (avail_scaled > sum_qty) {
+                qualifying_supps.insert(sk);
+            }
         }
     }
+    TRACE_COUNT("q20_partsupp_scanned", ps_scanned);
+    TRACE_COUNT("q20_qualifying_supps", qualifying_supps.size());
 
     // Filter suppliers in FRANCE
     struct Result { std::string name; std::string address; };
@@ -86,11 +105,18 @@ static void run_q20(Database* db, const std::string& run_nr) {
         }
     }
 
-    // Sort by s_name
-    std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
-        return a.name < b.name;
-    });
+    {
+        PROFILE_SCOPE("q20_sort");
+        // Sort by s_name
+        std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
+            return a.name < b.name;
+        });
+    }
+    TRACE_COUNT("q20_sort_rows_in", results.size());
+    TRACE_COUNT("q20_sort_rows_out", results.size());
 
+    {
+    PROFILE_SCOPE("q20_output");
     std::ostringstream oss;
     write_csv_header(oss, {"s_name","s_address"});
     for (auto& r : results) {
@@ -102,4 +128,7 @@ static void run_q20(Database* db, const std::string& run_nr) {
     out << result;
     out.close();
     std::cout << result;
+    TRACE_COUNT("q20_query_output_rows", results.size());
+    }
+    TRACE_FLUSH();
 }

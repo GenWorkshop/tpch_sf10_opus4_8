@@ -1,6 +1,7 @@
 #pragma once
 #include "builder_impl.hpp"
 #include "query_utils.hpp"
+#include "trace_utils.hpp"
 #include <algorithm>
 #include <sstream>
 #include <fstream>
@@ -26,18 +27,31 @@ static void run_q15(Database* db, const std::string& run_nr) {
 
     // Compute revenue per supplier: sum(l_extendedprice * (1 - l_discount)) scale 4
     std::unordered_map<int32_t, int64_t> supp_revenue;
-    for (int64_t i = 0; i < db->lineitem_count; i++) {
-        int32_t sd = db->l_shipdate[i];
-        if (sd >= date_start && sd < date_end) {
-            int64_t rev = db->l_extendedprice[i] * (100 - db->l_discount[i]);
-            supp_revenue[db->l_suppkey[i]] += rev;
+    TRACE_DECL(rows_scanned);
+    TRACE_DECL(rows_emitted);
+    {
+        PROFILE_SCOPE("q15_lineitem_scan_agg");
+        for (int64_t i = 0; i < db->lineitem_count; i++) {
+            TRACE_INC(rows_scanned);
+            int32_t sd = db->l_shipdate[i];
+            if (sd >= date_start && sd < date_end) {
+                TRACE_INC(rows_emitted);
+                int64_t rev = db->l_extendedprice[i] * (100 - db->l_discount[i]);
+                supp_revenue[db->l_suppkey[i]] += rev;
+            }
         }
     }
+    TRACE_COUNT("q15_rows_scanned", rows_scanned);
+    TRACE_COUNT("q15_rows_emitted", rows_emitted);
+    TRACE_COUNT("q15_groups_created", supp_revenue.size());
 
     // Find max revenue
     int64_t max_rev = 0;
-    for (auto& [sk, rev] : supp_revenue) {
-        if (rev > max_rev) max_rev = rev;
+    {
+        PROFILE_SCOPE("q15_max");
+        for (auto& [sk, rev] : supp_revenue) {
+            if (rev > max_rev) max_rev = rev;
+        }
     }
 
     // Collect suppliers with max revenue
@@ -49,11 +63,18 @@ static void run_q15(Database* db, const std::string& run_nr) {
         }
     }
 
-    // Sort by s_suppkey
-    std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
-        return a.suppkey < b.suppkey;
-    });
+    {
+        PROFILE_SCOPE("q15_sort");
+        // Sort by s_suppkey
+        std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
+            return a.suppkey < b.suppkey;
+        });
+    }
+    TRACE_COUNT("q15_sort_rows_in", results.size());
+    TRACE_COUNT("q15_sort_rows_out", results.size());
 
+    {
+    PROFILE_SCOPE("q15_output");
     std::ostringstream oss;
     write_csv_header(oss, {"s_suppkey","s_name","s_address","s_phone","total_revenue"});
     for (auto& r : results) {
@@ -72,4 +93,7 @@ static void run_q15(Database* db, const std::string& run_nr) {
     out << result;
     out.close();
     std::cout << result;
+    TRACE_COUNT("q15_query_output_rows", results.size());
+    }
+    TRACE_FLUSH();
 }

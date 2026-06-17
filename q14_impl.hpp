@@ -1,6 +1,7 @@
 #pragma once
 #include "builder_impl.hpp"
 #include "query_utils.hpp"
+#include "trace_utils.hpp"
 #include <sstream>
 #include <fstream>
 
@@ -25,22 +26,35 @@ static void run_q14(Database* db, const std::string& run_nr) {
     int64_t promo_sum = 0;
     int64_t total_sum = 0;
 
-    for (int64_t i = 0; i < db->lineitem_count; i++) {
-        int32_t sd = db->l_shipdate[i];
-        if (sd >= date_start && sd < date_end) {
-            int64_t volume = db->l_extendedprice[i] * (100 - db->l_discount[i]);
-            total_sum += volume;
+    TRACE_DECL(rows_scanned);
+    TRACE_DECL(rows_emitted);
+    {
+        PROFILE_SCOPE("q14_scan_join");
+        for (int64_t i = 0; i < db->lineitem_count; i++) {
+            TRACE_INC(rows_scanned);
+            int32_t sd = db->l_shipdate[i];
+            if (sd >= date_start && sd < date_end) {
+                TRACE_INC(rows_emitted);
+                int64_t volume = db->l_extendedprice[i] * (100 - db->l_discount[i]);
+                total_sum += volume;
 
-            int32_t pk = db->l_partkey[i];
-            const std::string& ptype = db->p_type[pk];
-            if (ptype.size() >= 5 && ptype.substr(0, 5) == "PROMO") {
-                promo_sum += volume;
+                int32_t pk = db->l_partkey[i];
+                const std::string& ptype = db->p_type[pk];
+                if (ptype.size() >= 5 && ptype.substr(0, 5) == "PROMO") {
+                    promo_sum += volume;
+                }
             }
         }
     }
+    TRACE_COUNT("q14_rows_scanned", rows_scanned);
+    TRACE_COUNT("q14_rows_emitted", rows_emitted);
+    TRACE_COUNT("q14_probe_rows_in", rows_emitted);
+    TRACE_COUNT("q14_join_rows_emitted", rows_emitted);
 
     double promo_revenue = total_sum > 0 ? 100.0 * (double)promo_sum / (double)total_sum : 0.0;
 
+    {
+    PROFILE_SCOPE("q14_output");
     std::ostringstream oss;
     write_csv_header(oss, {"promo_revenue"});
     write_csv_row(oss, {fmt_decimal(promo_revenue, 15)});
@@ -50,4 +64,7 @@ static void run_q14(Database* db, const std::string& run_nr) {
     out << result;
     out.close();
     std::cout << result;
+    TRACE_COUNT("q14_query_output_rows", 1);
+    }
+    TRACE_FLUSH();
 }

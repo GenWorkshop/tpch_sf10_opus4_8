@@ -1,6 +1,7 @@
 #pragma once
 #include "builder_impl.hpp"
 #include "query_utils.hpp"
+#include "trace_utils.hpp"
 #include <algorithm>
 #include <sstream>
 #include <fstream>
@@ -57,56 +58,80 @@ static void run_q2(Database* db, const std::string& run_nr) {
     // Build a map: partkey -> vector of {suppkey, supplycost}
     struct PSEntry { int32_t suppkey; int64_t supplycost; };
     std::unordered_map<int32_t, std::vector<PSEntry>> ps_by_part;
-    for (int64_t i = 0; i < db->partsupp_count; i++) {
-        int32_t sk = db->ps_suppkey[i];
-        if (asia_suppliers.count(sk)) {
-            ps_by_part[db->ps_partkey[i]].push_back({sk, db->ps_supplycost[i]});
-        }
-    }
-
-    // Scan parts
-    for (int32_t pk = 1; pk < (int32_t)db->p_size.size(); pk++) {
-        if (db->p_size[pk] != 8) continue;
-        const std::string& ptype = db->p_type[pk];
-        // Check LIKE '%TIN' - ends with "TIN"
-        if (ptype.size() < 3 || ptype.substr(ptype.size() - 3) != "TIN") continue;
-
-        auto it = ps_by_part.find(pk);
-        if (it == ps_by_part.end()) continue;
-
-        // Find min supplycost for this part among ASIA suppliers
-        int64_t min_cost = LLONG_MAX;
-        for (auto& e : it->second) {
-            if (e.supplycost < min_cost) min_cost = e.supplycost;
-        }
-
-        // Collect all suppliers with min cost
-        for (auto& e : it->second) {
-            if (e.supplycost == min_cost) {
-                int32_t sk = e.suppkey;
-                int32_t nk = db->s_nationkey[sk];
-                results.push_back({
-                    db->s_acctbal[sk],
-                    db->s_name[sk],
-                    db->nationkey_to_name[nk],
-                    pk,
-                    db->p_mfgr[pk],
-                    db->s_address[sk],
-                    db->s_phone[sk],
-                    db->s_comment[sk]
-                });
+    TRACE_DECL(ps_scanned);
+    {
+        PROFILE_SCOPE("q2_partsupp_build");
+        for (int64_t i = 0; i < db->partsupp_count; i++) {
+            TRACE_INC(ps_scanned);
+            int32_t sk = db->ps_suppkey[i];
+            if (asia_suppliers.count(sk)) {
+                ps_by_part[db->ps_partkey[i]].push_back({sk, db->ps_supplycost[i]});
             }
         }
     }
+    TRACE_COUNT("q2_partsupp_scanned", ps_scanned);
+    TRACE_COUNT("q2_build_rows", ps_by_part.size());
 
-    // Sort: s_acctbal DESC, n_name ASC, s_name ASC, p_partkey ASC
-    std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
-        if (a.s_acctbal != b.s_acctbal) return a.s_acctbal > b.s_acctbal;
-        if (a.n_name != b.n_name) return a.n_name < b.n_name;
-        if (a.s_name != b.s_name) return a.s_name < b.s_name;
-        return a.p_partkey < b.p_partkey;
-    });
+    // Scan parts
+    TRACE_DECL(parts_scanned);
+    TRACE_DECL(parts_matched);
+    {
+        PROFILE_SCOPE("q2_part_scan_probe");
+        for (int32_t pk = 1; pk < (int32_t)db->p_size.size(); pk++) {
+            TRACE_INC(parts_scanned);
+            if (db->p_size[pk] != 8) continue;
+            const std::string& ptype = db->p_type[pk];
+            // Check LIKE '%TIN' - ends with "TIN"
+            if (ptype.size() < 3 || ptype.substr(ptype.size() - 3) != "TIN") continue;
 
+            auto it = ps_by_part.find(pk);
+            if (it == ps_by_part.end()) continue;
+            TRACE_INC(parts_matched);
+
+            // Find min supplycost for this part among ASIA suppliers
+            int64_t min_cost = LLONG_MAX;
+            for (auto& e : it->second) {
+                if (e.supplycost < min_cost) min_cost = e.supplycost;
+            }
+
+            // Collect all suppliers with min cost
+            for (auto& e : it->second) {
+                if (e.supplycost == min_cost) {
+                    int32_t sk = e.suppkey;
+                    int32_t nk = db->s_nationkey[sk];
+                    results.push_back({
+                        db->s_acctbal[sk],
+                        db->s_name[sk],
+                        db->nationkey_to_name[nk],
+                        pk,
+                        db->p_mfgr[pk],
+                        db->s_address[sk],
+                        db->s_phone[sk],
+                        db->s_comment[sk]
+                    });
+                }
+            }
+        }
+    }
+    TRACE_COUNT("q2_parts_scanned", parts_scanned);
+    TRACE_COUNT("q2_parts_matched", parts_matched);
+    TRACE_COUNT("q2_join_rows_emitted", results.size());
+
+    {
+        PROFILE_SCOPE("q2_sort");
+        // Sort: s_acctbal DESC, n_name ASC, s_name ASC, p_partkey ASC
+        std::sort(results.begin(), results.end(), [](const Result& a, const Result& b) {
+            if (a.s_acctbal != b.s_acctbal) return a.s_acctbal > b.s_acctbal;
+            if (a.n_name != b.n_name) return a.n_name < b.n_name;
+            if (a.s_name != b.s_name) return a.s_name < b.s_name;
+            return a.p_partkey < b.p_partkey;
+        });
+    }
+    TRACE_COUNT("q2_sort_rows_in", results.size());
+    TRACE_COUNT("q2_sort_rows_out", results.size());
+
+    {
+    PROFILE_SCOPE("q2_output");
     std::ostringstream oss;
     write_csv_header(oss, {"s_acctbal","s_name","n_name","p_partkey","p_mfgr","s_address","s_phone","s_comment"});
 
@@ -128,4 +153,7 @@ static void run_q2(Database* db, const std::string& run_nr) {
     out << result;
     out.close();
     std::cout << result;
+    TRACE_COUNT("q2_query_output_rows", results.size());
+    }
+    TRACE_FLUSH();
 }
