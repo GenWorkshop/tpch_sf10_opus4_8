@@ -248,15 +248,13 @@ Database* build(ParquetTables* pt) {
     }
 
     if (db->lineitem_sorted_by_orderkey) {
-        db->orderkey_lineitem_start.assign(db->max_orderkey + 2, 0);
-        db->orderkey_lineitem_end.assign(db->max_orderkey + 2, 0);
+        db->orderkey_lineitem_range.assign(db->max_orderkey + 2, {0, 0});
         int64_t i = 0;
         while (i < db->n_lineitem) {
             int32_t ok = db->l_orderkey[i];
             int64_t start = i;
             while (i < db->n_lineitem && db->l_orderkey[i] == ok) i++;
-            db->orderkey_lineitem_start[ok] = start;
-            db->orderkey_lineitem_end[ok] = i;
+            db->orderkey_lineitem_range[ok] = {(int32_t)start, (int32_t)i};
         }
     }
 

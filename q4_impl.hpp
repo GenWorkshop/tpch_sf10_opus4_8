@@ -25,8 +25,7 @@ inline void run_q4_impl(Database* db, std::ostream& out) {
     if (db->lineitem_sorted_by_orderkey) {
         const Date* __restrict odate = db->o_orderdate.data();
         const int32_t* __restrict okey = db->o_orderkey.data();
-        const int64_t* __restrict ls = db->orderkey_lineitem_start.data();
-        const int64_t* __restrict le = db->orderkey_lineitem_end.data();
+        const Database::LineitemRange* __restrict lrng = db->orderkey_lineitem_range.data();
         const Date* __restrict lc = db->l_commitdate.data();
         const Date* __restrict lr = db->l_receiptdate.data();
 
@@ -53,26 +52,25 @@ inline void run_q4_impl(Database* db, std::ostream& out) {
         {
             PROFILE_SCOPE("q4_orders_scan_agg");
             const int n = (int)npass;
-            const int PF1 = 48;  // prefetch CSR boundaries this far ahead
-            const int PF2 = 20;  // prefetch lineitem dates this far ahead
+            const int PF1 = 64;  // prefetch CSR boundaries this far ahead
+            const int PF2 = 32;  // prefetch lineitem dates this far ahead
             for (int k = 0; k < n; k++) {
                 if (k + PF1 < n) {
                     int32_t fok = okey[pbuf[k + PF1]];
-                    __builtin_prefetch(&ls[fok], 0, 1);
-                    __builtin_prefetch(&le[fok], 0, 1);
+                    __builtin_prefetch(&lrng[fok], 0, 1);
                 }
                 if (k + PF2 < n) {
                     int32_t mok = okey[pbuf[k + PF2]];
-                    int64_t ms = ls[mok];
+                    int32_t ms = lrng[mok].start;
                     __builtin_prefetch(&lc[ms], 0, 1);
                     __builtin_prefetch(&lr[ms], 0, 1);
                 }
                 int32_t row = pbuf[k];
                 int32_t ok = okey[row];
-                int64_t start = ls[ok];
-                int64_t end = le[ok];
+                int32_t start = lrng[ok].start;
+                int32_t end = lrng[ok].end;
                 bool late = false;
-                for (int64_t j = start; j < end; j++) {
+                for (int32_t j = start; j < end; j++) {
                     TRACE_INC(li_probed);
                     if (lc[j] < lr[j]) { late = true; break; }
                 }

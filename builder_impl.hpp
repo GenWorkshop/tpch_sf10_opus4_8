@@ -109,11 +109,11 @@ struct Database {
     // To get dollars: revenue[i] / 10000.0
     // No, let's keep it simpler: store as int64 raw product for exact computation at query time.
 
-    // Orderkey CSR: for each orderkey, start position in lineitem arrays
-    // orderkey_pos[orderkey] = start index, orderkey_pos[orderkey+1] = end index
-    // (only if lineitem is sorted by orderkey)
-    std::vector<int64_t> orderkey_lineitem_start;  // indexed by orderkey
-    std::vector<int64_t> orderkey_lineitem_end;
+    // Orderkey CSR: for each orderkey, the [start,end) range in the lineitem
+    // arrays, packed so both bounds land in a single cacheline gather.
+    // (only populated if lineitem is sorted by orderkey)
+    struct LineitemRange { int32_t start; int32_t end; };
+    std::vector<LineitemRange> orderkey_lineitem_range;  // indexed by orderkey
     bool lineitem_sorted_by_orderkey = false;
 };
 
