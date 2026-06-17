@@ -6,8 +6,8 @@
 #include <vector>
 #include <string>
 #include <unordered_set>
-#include <unordered_map>
 #include <climits>
+#include <cstdint>
 
 inline void run_q2_impl(Database* db, std::ostream& out) {
     PROFILE_SCOPE("q2_total");
@@ -41,31 +41,45 @@ inline void run_q2_impl(Database* db, std::ostream& out) {
         supp_in_asia[idx] = true;
     }
 
-    // Filter parts: p_size = 8 AND p_type LIKE '%TIN'
-    std::vector<int32_t> matching_parts; // partkey (1-based), stored as index (0-based)
+    // Filter parts: p_size = 8 AND p_type LIKE '%TIN'.
+    // Dense bool flag per part (0-based partkey-1) acts as the build side of the
+    // ps_partkey = p_partkey join (DuckDB builds on the filtered part set).
+    std::vector<char> part_match(db->n_part, 0);
     {
         PROFILE_SCOPE("q2_part_scan");
         for (int32_t i = 0; i < db->n_part; i++) {
             TRACE_INC(part_scanned);
             if (db->p_size[i] == 8) {
                 const auto& t = db->p_type[i];
-                if (t.size() >= 3 && t.substr(t.size() - 3) == "TIN") {
+                if (t.size() >= 3 && t.compare(t.size() - 3, 3, "TIN") == 0) {
                     TRACE_INC(part_emitted);
-                    matching_parts.push_back(i);
+                    part_match[i] = 1;
                 }
             }
         }
     }
 
-    // For each matching part, find min supplycost among ASIA suppliers in partsupp
-    // Build partkey → partsupp rows index
-    // partsupp is sorted by (ps_partkey, ps_suppkey) typically
-    // For efficiency, build a map: partkey → list of partsupp row indices
-    std::unordered_map<int32_t, std::vector<int32_t>> partkey_to_ps;
+    // Per-part minimum supplycost over ASIA suppliers (the correlated subquery).
+    // Dense array indexed by partkey-1; only matching parts are ever touched.
+    std::vector<int64_t> min_cost(db->n_part, INT64_MAX);
+
+    const int32_t* ps_pk = db->ps_partkey.data();
+    const int32_t* ps_sk = db->ps_suppkey.data();
+    const int64_t* ps_cost = db->ps_supplycost.data();
+    const int32_t n_ps = db->n_partsupp;
+    const int32_t n_supp = db->n_supplier;
+
+    // Pass 1: probe partsupp, accumulate min supplycost per matching part.
     {
-        PROFILE_SCOPE("q2_partsupp_build");
-        for (int32_t i = 0; i < db->n_partsupp; i++) {
-            partkey_to_ps[db->ps_partkey[i]].push_back(i);
+        PROFILE_SCOPE("q2_partsupp_min");
+        for (int32_t i = 0; i < n_ps; i++) {
+            int32_t p = ps_pk[i] - 1;
+            if (!part_match[p]) continue;
+            int32_t s_idx = ps_sk[i] - 1;
+            if ((uint32_t)s_idx >= (uint32_t)n_supp || !supp_in_asia[s_idx]) continue;
+            TRACE_INC(probe_rows);
+            int64_t c = ps_cost[i];
+            if (c < min_cost[p]) min_cost[p] = c;
         }
     }
 
@@ -78,38 +92,16 @@ inline void run_q2_impl(Database* db, std::ostream& out) {
 
     std::vector<Result> results;
 
+    // Pass 2: emit (part, supplier) rows whose supplycost equals the part minimum.
     {
         PROFILE_SCOPE("q2_join_probe");
-        for (int32_t p_idx : matching_parts) {
-            int32_t partkey = p_idx + 1; // partkeys are 1-based
-            auto it = partkey_to_ps.find(partkey);
-            if (it == partkey_to_ps.end()) continue;
-
-            // Find min supplycost among ASIA suppliers for this part
-            int64_t min_cost = INT64_MAX;
-            for (int32_t ps_row : it->second) {
-                TRACE_INC(probe_rows);
-                int32_t suppkey = db->ps_suppkey[ps_row];
-                int32_t s_idx = suppkey - 1; // 0-based
-                if (s_idx >= 0 && s_idx < db->n_supplier && supp_in_asia[s_idx]) {
-                    if (db->ps_supplycost[ps_row] < min_cost) {
-                        min_cost = db->ps_supplycost[ps_row];
-                    }
-                }
-            }
-
-            if (min_cost == INT64_MAX) continue;
-
-            // Now find all (supplier, partsupp) combos that match min_cost in ASIA
-            for (int32_t ps_row : it->second) {
-                int32_t suppkey = db->ps_suppkey[ps_row];
-                int32_t s_idx = suppkey - 1;
-                if (s_idx >= 0 && s_idx < db->n_supplier && supp_in_asia[s_idx]) {
-                    if (db->ps_supplycost[ps_row] == min_cost) {
-                        results.push_back({db->s_acctbal[s_idx], s_idx, db->s_nationkey[s_idx], p_idx});
-                    }
-                }
-            }
+        for (int32_t i = 0; i < n_ps; i++) {
+            int32_t p = ps_pk[i] - 1;
+            if (!part_match[p]) continue;
+            if (ps_cost[i] != min_cost[p]) continue;
+            int32_t s_idx = ps_sk[i] - 1;
+            if ((uint32_t)s_idx >= (uint32_t)n_supp || !supp_in_asia[s_idx]) continue;
+            results.push_back({db->s_acctbal[s_idx], s_idx, db->s_nationkey[s_idx], p});
         }
     }
 
