@@ -45,20 +45,38 @@ inline void run_q19_impl(Database* db, std::ostream& out) {
         const std::string* __restrict pb = db->p_brand.data();
         const std::string* __restrict pc = db->p_container.data();
         const int32_t* __restrict ps = db->p_size.data();
+
+        // p_brand is always exactly "Brand#NN" (8 bytes, SSO-inline) and every
+        // relevant p_container is <=8 bytes, so pack them into a single uint64
+        // word and compare with integer ops instead of std::string::operator==.
+        auto pack = [](const char* s, size_t n) -> uint64_t {
+            uint64_t w = 0; std::memcpy(&w, s, n); return w;
+        };
+        const uint64_t B14 = pack("Brand#14", 8);
+        const uint64_t B15 = pack("Brand#15", 8);
+        const uint64_t B35 = pack("Brand#35", 8);
+        const uint64_t SM0 = pack("SM CASE", 7), SM1 = pack("SM BOX", 6),
+                       SM2 = pack("SM PACK", 7), SM3 = pack("SM PKG", 6);
+        const uint64_t MD0 = pack("MED BAG", 7), MD1 = pack("MED BOX", 7),
+                       MD2 = pack("MED PKG", 7), MD3 = pack("MED PACK", 8);
+        const uint64_t LG0 = pack("LG CASE", 7), LG1 = pack("LG BOX", 6),
+                       LG2 = pack("LG PACK", 7), LG3 = pack("LG PKG", 6);
+
         for (int32_t p = 0; p < n_part; p++) {
-            const std::string& brand = pb[p];
-            const std::string& container = pc[p];
+            uint64_t bw; std::memcpy(&bw, pb[p].data(), 8);
             const int32_t sz = ps[p];
+            const size_t cn = pc[p].size();
             uint8_t g = 0;
-            if (brand == "Brand#14" && sz <= 5 &&
-                (container == "SM CASE" || container == "SM BOX" || container == "SM PACK" || container == "SM PKG")) {
-                g = 1;
-            } else if (brand == "Brand#15" && sz <= 10 &&
-                (container == "MED BAG" || container == "MED BOX" || container == "MED PKG" || container == "MED PACK")) {
-                g = 2;
-            } else if (brand == "Brand#35" && sz <= 15 &&
-                (container == "LG CASE" || container == "LG BOX" || container == "LG PACK" || container == "LG PKG")) {
-                g = 3;
+            // Containers longer than 8 bytes cannot match any target value.
+            if (cn <= 8) {
+                uint64_t cw = pack(pc[p].data(), cn);
+                if (bw == B14) {
+                    if (sz <= 5 && (cw == SM0 || cw == SM1 || cw == SM2 || cw == SM3)) g = 1;
+                } else if (bw == B15) {
+                    if (sz <= 10 && (cw == MD0 || cw == MD1 || cw == MD2 || cw == MD3)) g = 2;
+                } else if (bw == B35) {
+                    if (sz <= 15 && (cw == LG0 || cw == LG1 || cw == LG2 || cw == LG3)) g = 3;
+                }
             }
             pgroup[p] = g;
         }
