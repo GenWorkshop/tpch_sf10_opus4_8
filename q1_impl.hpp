@@ -27,13 +27,11 @@ inline void run_q1_impl(Database* db, std::ostream& out) {
     // avoids the per-row tree lookup of std::map. Iterating the array in
     // index order yields the required ORDER BY rf, ls.
     struct Agg {
-        __int128 sum_qty = 0;        // scale 2
-        __int128 sum_base_price = 0; // scale 2
-        __int128 sum_disc_price = 0; // scale 4 (price*discount both scale 2 → product scale 4)
-        __int128 sum_charge = 0;     // scale 6 (disc_price * tax, scale 4 * scale 2 → scale 6)
-        double sum_qty_d = 0;
-        double sum_price_d = 0;
-        double sum_disc_d = 0;
+        int64_t sum_qty = 0;        // scale 2
+        int64_t sum_base_price = 0; // scale 2
+        int64_t sum_disc_price = 0; // scale 4 (price*discount both scale 2 → product scale 4)
+        int64_t sum_charge = 0;     // scale 6 (disc_price * tax, scale 4 * scale 2 → scale 6)
+        int64_t sum_disc = 0;       // scale 2 (for avg)
         int64_t count = 0;
     };
 
@@ -69,15 +67,12 @@ inline void run_q1_impl(Database* db, std::ostream& out) {
                 g.sum_qty += qty;
                 g.sum_base_price += price;
 
-                __int128 disc_price = (__int128)price * (100 - disc);
+                int64_t disc_price = price * (100 - disc);
                 g.sum_disc_price += disc_price;
 
-                __int128 charge = disc_price * (100 + tax);
-                g.sum_charge += charge;
+                g.sum_charge += disc_price * (100 + tax);
 
-                g.sum_qty_d += qty;
-                g.sum_price_d += price;
-                g.sum_disc_d += disc;
+                g.sum_disc += disc;
                 g.count++;
             }
         }
@@ -105,12 +100,10 @@ inline void run_q1_impl(Database* db, std::ostream& out) {
         std::string s_sum_disc_price = fmt_money(static_cast<long long>(g.sum_disc_price), 4);
         // sum_charge: scale 6
         std::string s_sum_charge = fmt_money(static_cast<long long>(g.sum_charge), 6);
-        // avg_qty: qty is scale 2, so avg = sum_qty_d / count / 100
-        double avg_qty = (g.sum_qty_d / g.count) / 100.0;
-        // avg_price: price is scale 2
-        double avg_price = (g.sum_price_d / g.count) / 100.0;
-        // avg_disc: disc is scale 2
-        double avg_disc = (g.sum_disc_d / g.count) / 100.0;
+        // avgs derived from exact int sums (values stored at scale 2)
+        double avg_qty = (double)g.sum_qty / g.count / 100.0;
+        double avg_price = (double)g.sum_base_price / g.count / 100.0;
+        double avg_disc = (double)g.sum_disc / g.count / 100.0;
 
         std::string rf_s(1, key.first);
         std::string ls_s(1, key.second);
