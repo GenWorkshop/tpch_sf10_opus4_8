@@ -4,7 +4,7 @@
 #include "q1_impl.hpp" // date_to_epoch
 #include <ostream>
 #include <vector>
-#include <unordered_map>
+#include <string>
 #include <algorithm>
 
 inline void run_q10_impl(Database* db, std::ostream& out) {
@@ -15,40 +15,48 @@ inline void run_q10_impl(Database* db, std::ostream& out) {
     const Date date_lo = date_to_epoch(1993, 8, 1);
     const Date date_hi = date_to_epoch(1993, 11, 1);
 
-    // Find qualifying orders and map orderkey → custkey
-    std::vector<bool> order_qualifies(db->n_orders, false);
-    for (int32_t i = 0; i < db->n_orders; i++) {
-        if (db->o_orderdate[i] >= date_lo && db->o_orderdate[i] < date_hi) {
-            order_qualifies[i] = true;
-        }
-    }
+    // Dense per-customer revenue accumulator (custkeys are dense 1..n_customer).
+    // Group key in TPC-H Q10 is c_custkey (the other grouping columns are
+    // functionally dependent on it), so a single int64 per customer suffices.
+    std::vector<int64_t> cust_revenue(db->n_customer + 1, 0);
 
-    // Scan lineitem: filter returnflag='R', join with qualifying orders
-    // Group by custkey → sum revenue
-    std::unordered_map<int32_t, int64_t> cust_revenue; // custkey → revenue (scale 4)
-
+    // Drive from the (small) set of date-qualifying orders and gather only the
+    // lineitems belonging to those orders via the orderkey CSR range, instead
+    // of scanning the entire lineitem table.  This mirrors the plan's
+    // orders→lineitem join with the orders side as the small build input.
     {
-        PROFILE_SCOPE("q10_lineitem_scan_join_agg");
-        for (int64_t i = 0; i < db->n_lineitem; i++) {
-            TRACE_INC(li_scanned);
-            if (db->l_returnflag[i] != 'R') continue;
+        PROFILE_SCOPE("q10_orders_lineitem_join_agg");
+        const bool have_csr = db->lineitem_sorted_by_orderkey &&
+                              !db->orderkey_lineitem_range.empty();
+        for (int32_t oi = 0; oi < db->n_orders; oi++) {
+            const Date od = db->o_orderdate[oi];
+            if (od < date_lo || od >= date_hi) continue;
 
-            int32_t orderkey = db->l_orderkey[i];
-            if (orderkey > db->max_orderkey) continue;
-            int32_t o_idx = db->orderkey_to_idx[orderkey];
-            if (o_idx < 0 || !order_qualifies[o_idx]) continue;
+            const int32_t orderkey = db->o_orderkey[oi];
+            const int32_t custkey = db->o_custkey[oi];
 
-            TRACE_INC(li_emitted);
-            int32_t custkey = db->o_custkey[o_idx];
-            int64_t rev = db->l_extendedprice[i] * (100 - db->l_discount[i]); // scale 4
+            int32_t start, end;
+            if (have_csr) {
+                const auto& r = db->orderkey_lineitem_range[orderkey];
+                start = r.start;
+                end = r.end;
+            } else {
+                continue;
+            }
+
+            int64_t rev = 0;
+            for (int32_t j = start; j < end; j++) {
+                TRACE_INC(li_scanned);
+                if (db->l_returnflag[j] != 'R') continue;
+                TRACE_INC(li_emitted);
+                rev += db->l_extendedprice[j] * (100 - db->l_discount[j]); // scale 4
+            }
             cust_revenue[custkey] += rev;
         }
     }
     TRACE_COUNT("q10_rows_scanned", li_scanned);
     TRACE_COUNT("q10_join_rows_emitted", li_emitted);
     TRACE_COUNT("q10_agg_rows_in", li_emitted);
-    TRACE_COUNT("q10_groups_created", (uint64_t)cust_revenue.size());
-    TRACE_COUNT("q10_agg_rows_emitted", (uint64_t)cust_revenue.size());
 
     // Build result rows
     struct ResultRow {
@@ -56,10 +64,11 @@ inline void run_q10_impl(Database* db, std::ostream& out) {
         int64_t revenue;
     };
     std::vector<ResultRow> results;
-    results.reserve(cust_revenue.size());
-    for (auto& [ck, rev] : cust_revenue) {
-        results.push_back({ck, rev});
+    for (int32_t ck = 1; ck <= db->n_customer; ck++) {
+        if (cust_revenue[ck] != 0) results.push_back({ck, cust_revenue[ck]});
     }
+    TRACE_COUNT("q10_groups_created", (uint64_t)results.size());
+    TRACE_COUNT("q10_agg_rows_emitted", (uint64_t)results.size());
 
     // Order by revenue desc
     TRACE_COUNT("q10_sort_rows_in", (uint64_t)results.size());
@@ -73,19 +82,61 @@ inline void run_q10_impl(Database* db, std::ostream& out) {
 
     PROFILE_SCOPE("q10_output");
     write_csv_header(out, {"c_custkey","c_name","revenue","c_acctbal","n_name","c_address","c_phone","c_comment"});
+
+    // Fast manual CSV serialization into a single buffer.  Avoids per-field
+    // std::string allocations and ostringstream overhead in the hot output
+    // loop (which dominates this query's runtime).
+    std::string buf;
+    buf.reserve((size_t)results.size() * 160 + 64);
+
+    char numbuf[32];
+    auto append_int = [&](int64_t v) {
+        if (v == 0) { buf.push_back('0'); return; }
+        bool neg = v < 0;
+        uint64_t u = neg ? (uint64_t)(-v) : (uint64_t)v;
+        char* p = numbuf + sizeof(numbuf);
+        while (u) { *--p = char('0' + (u % 10)); u /= 10; }
+        if (neg) *--p = '-';
+        buf.append(p, numbuf + sizeof(numbuf) - p);
+    };
+    auto append_money = [&](int64_t cents, int scale) {
+        bool neg = cents < 0;
+        uint64_t u = neg ? (uint64_t)(-cents) : (uint64_t)cents;
+        char* p = numbuf + sizeof(numbuf);
+        for (int i = 0; i < scale; ++i) { *--p = char('0' + (u % 10)); u /= 10; }
+        *--p = '.';
+        if (u == 0) { *--p = '0'; }
+        else { while (u) { *--p = char('0' + (u % 10)); u /= 10; } }
+        if (neg) *--p = '-';
+        buf.append(p, numbuf + sizeof(numbuf) - p);
+    };
+    auto append_quoted = [&](const std::string& s) {
+        bool needs = false;
+        for (char c : s) {
+            if (c == ',' || c == '"' || c == '\n' || c == '\r' || c == '\\') { needs = true; break; }
+        }
+        if (!needs) { buf.append(s); return; }
+        buf.push_back('"');
+        for (char c : s) {
+            if (c == '"') buf.push_back('"');
+            buf.push_back(c);
+        }
+        buf.push_back('"');
+    };
+
     for (auto& r : results) {
         int32_t c_idx = r.c_custkey - 1;
         int32_t nk = db->c_nationkey[c_idx];
-        write_csv_row(out, {
-            std::to_string(r.c_custkey),
-            csv_quote(db->c_name[c_idx]),
-            fmt_money(r.revenue, 4),
-            fmt_money(db->c_acctbal[c_idx], 2),
-            csv_quote(db->n_name[nk]),
-            csv_quote(db->c_address[c_idx]),
-            csv_quote(db->c_phone[c_idx]),
-            csv_quote(db->c_comment[c_idx])
-        });
+        append_int(r.c_custkey);            buf.push_back(',');
+        append_quoted(db->c_name[c_idx]);   buf.push_back(',');
+        append_money(r.revenue, 4);         buf.push_back(',');
+        append_money(db->c_acctbal[c_idx], 2); buf.push_back(',');
+        append_quoted(db->n_name[nk]);      buf.push_back(',');
+        append_quoted(db->c_address[c_idx]); buf.push_back(',');
+        append_quoted(db->c_phone[c_idx]);  buf.push_back(',');
+        append_quoted(db->c_comment[c_idx]);
+        buf.push_back('\n');
     }
+    out.write(buf.data(), (std::streamsize)buf.size());
     TRACE_COUNT("q10_query_output_rows", (uint64_t)results.size());
 }
