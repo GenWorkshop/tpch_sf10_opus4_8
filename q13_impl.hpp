@@ -6,12 +6,30 @@
 #include <unordered_map>
 #include <algorithm>
 #include <string>
+#include <cstring>
 
 inline bool matches_express_requests(const std::string& s) {
-    // Match pattern '%express%requests%'
-    auto pos = s.find("express");
-    if (pos == std::string::npos) return false;
-    return s.find("requests", pos + 7) != std::string::npos;
+    // Match pattern '%express%requests%'.
+    // Scan for the rare anchor chars 'x' (in expre[x]s) and 'q' (in re[q]uests)
+    // rather than the common 'e' to minimize candidate verifications.
+    const char* d = s.data();
+    size_t len = s.size();
+    const char* end = d + len;
+    const char* p = static_cast<const char*>(memchr(d, 'x', len));
+    while (p) {
+        if (p - d >= 1 && end - p >= 6 && std::memcmp(p - 1, "express", 7) == 0) {
+            const char* after = p + 6;
+            const char* q = static_cast<const char*>(memchr(after, 'q', end - after));
+            while (q) {
+                if (q - d >= 2 && end - q >= 6 && std::memcmp(q - 2, "requests", 8) == 0)
+                    return true;
+                q = static_cast<const char*>(memchr(q + 1, 'q', end - (q + 1)));
+            }
+            return false;
+        }
+        p = static_cast<const char*>(memchr(p + 1, 'x', end - (p + 1)));
+    }
+    return false;
 }
 
 inline void run_q13_impl(Database* db, std::ostream& out) {
@@ -26,11 +44,22 @@ inline void run_q13_impl(Database* db, std::ostream& out) {
 
     {
         PROFILE_SCOPE("q13_orders_scan_join");
-        for (int32_t i = 0; i < db->n_orders; i++) {
+        const std::string* comments = db->o_comment.data();
+        const int32_t* custkeys = db->o_custkey.data();
+        const int32_t n = db->n_orders;
+        constexpr int PFD = 16;
+        for (int32_t i = 0; i < n; i++) {
             TRACE_INC(orders_scanned);
-            if (!matches_express_requests(db->o_comment[i])) {
+            if (i + PFD < n) {
+                // Prefetch the heap char buffer of the comment PFD iterations ahead.
+                const std::string& fs = comments[i + PFD];
+                __builtin_prefetch(fs.data(), 0, 0);
+                __builtin_prefetch(&custkeys[i + PFD], 0, 1);
+            }
+            const std::string& cs = comments[i];
+            if (!matches_express_requests(cs)) {
                 TRACE_INC(orders_emitted);
-                int32_t custkey = db->o_custkey[i];
+                int32_t custkey = custkeys[i];
                 int32_t c_idx = custkey - 1;
                 if (c_idx >= 0 && c_idx < db->n_customer) {
                     cust_order_count[c_idx]++;
