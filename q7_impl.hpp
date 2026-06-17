@@ -5,6 +5,7 @@
 #include <ostream>
 #include <vector>
 #include <map>
+#include <cstdlib>
 
 // Extract year from epoch days
 inline int32_t epoch_to_year(int32_t days) {
@@ -54,7 +55,25 @@ inline void run_q7_impl(Database* db, std::ostream& out) {
     {
         PROFILE_SCOPE("q7_lineitem_scan_join_agg");
         if (db->lineitem_sorted_by_orderkey && db->orders_sorted_by_orderkey) {
-            // Merge-join: lineitem and orders both ascending by orderkey.
+            // Phase 1: branchless filter on (date range AND supplier nation),
+            // streaming shipdate/suppkey/orderkey sequentially. Survivors (~2.4%)
+            // are packed as {orderkey, (lineitem_idx<<1)|supp_code}. The buffer is
+            // malloc'd (no zero-init) and only the written prefix is page-faulted.
+            struct PassEnt { int32_t ok; int32_t isc; };
+            PassEnt* __restrict buf = (PassEnt*)std::malloc((size_t)(n + 1) * sizeof(PassEnt));
+            size_t np = 0;
+            const uint32_t range = (uint32_t)(date_hi - date_lo);
+            for (int64_t i = 0; i < n; i++) {
+                int8_t sc = scode[lsupp[i] - 1];
+                int cond = ((uint32_t)(shipdate[i] - date_lo) <= range) & (sc >= 0);
+                buf[np].ok = lorder[i];
+                buf[np].isc = (int32_t)((i << 1) | (sc & 1));
+                np += (size_t)cond;
+            }
+            TRACE_ADD(li_scanned, n);
+
+            // Phase 2: merge-join survivors against orders (both ascending by
+            // orderkey) to resolve customer nation, then aggregate.
             const int32_t* __restrict o_ok = db->o_orderkey.data();
             const int32_t* __restrict o_ck = db->o_custkey.data();
             const int32_t* __restrict c_nk = db->c_nationkey.data();
@@ -62,13 +81,8 @@ inline void run_q7_impl(Database* db, std::ostream& out) {
             int32_t op = 0;
             int32_t cur_ok = -1;
             int8_t cur_ccode = -1;
-            for (int64_t i = 0; i < n; i++) {
-                TRACE_INC(li_scanned);
-                Date sd = shipdate[i];
-                if (sd < date_lo || sd > date_hi) continue;
-                int8_t sc = scode[lsupp[i] - 1];
-                if (sc < 0) continue;
-                int32_t ok = lorder[i];
+            for (size_t k = 0; k < np; k++) {
+                int32_t ok = buf[k].ok;
                 if (ok != cur_ok) {
                     while (op < n_orders && o_ok[op] < ok) op++;
                     cur_ok = ok;
@@ -79,11 +93,15 @@ inline void run_q7_impl(Database* db, std::ostream& out) {
                     cur_ccode = cc;
                 }
                 int8_t cc = cur_ccode;
-                if (cc < 0 || cc == sc) continue;  // need opposite (ALG,BRA) or (BRA,ALG)
+                int32_t isc = buf[k].isc;
+                int8_t sc = (int8_t)(isc & 1);
+                if (cc < 0 || cc == sc) continue;  // need opposite (ALG,BRA)/(BRA,ALG)
+                int64_t i = isc >> 1;
                 TRACE_INC(li_emitted);
-                int32_t y = epoch_to_year(sd) - 1995;
+                int32_t y = epoch_to_year(shipdate[i]) - 1995;
                 acc[sc][y] += lprice[i] * (100 - ldisc[i]);
             }
+            std::free(buf);
         } else {
             // Fallback: random-access join via orderkey_to_idx.
             std::vector<int8_t> order_cust_nation(db->n_orders, -1);
