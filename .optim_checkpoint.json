@@ -3,6 +3,7 @@
   "completed_queries": [],
   "current_query": "q1",
   "completed_stages": [
-    "sample_plan"
+    "sample_plan",
+    "trace"
   ]
 }
