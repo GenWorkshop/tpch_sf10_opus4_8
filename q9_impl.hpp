@@ -16,24 +16,28 @@ inline void run_q9_impl(Database* db, std::ostream& out) {
     const int32_t n_part = db->n_part;
 
     // ---- Filter part: p_name like '%rosy%'  → dense ids for matching parts ----
-    // match[pk] (1-byte) is the hot per-lineitem filter; part_dense[pk] gives the
-    // compact partsupp slot, only touched for survivors.
-    std::vector<uint8_t> match(n_part + 1, 0);
+    // mbits is a bit-packed hot per-lineitem filter (≈250KB, L2-resident);
+    // part_dense[pk] gives the compact partsupp slot, only touched for survivors.
+    std::vector<uint64_t> mbits((n_part >> 6) + 2, 0);
     std::vector<int32_t> part_dense(n_part + 1, -1);
     int32_t nd = 0;
     for (int32_t i = 0; i < n_part; i++) {
         if (db->p_name[i].find("rosy") != std::string::npos) {
-            match[i + 1] = 1;
-            part_dense[i + 1] = nd++;
+            int32_t pk = i + 1;
+            mbits[pk >> 6] |= (uint64_t)1 << (pk & 63);
+            part_dense[pk] = nd++;
         }
     }
+    auto test_bit = [&](int32_t pk) -> bool {
+        return (mbits[pk >> 6] >> (pk & 63)) & 1;
+    };
 
     // ---- Build per-(matching)part contiguous partsupp arrays ----
     // ps_off[d]..ps_off[d+1] index ps_sk[]/ps_cv[] for dense part d.
     std::vector<int32_t> ps_off(nd + 1, 0);
     for (int32_t i = 0; i < db->n_partsupp; i++) {
         int32_t pk = db->ps_partkey[i];
-        if (pk <= n_part && match[pk]) ps_off[part_dense[pk] + 1]++;
+        if (pk <= n_part && test_bit(pk)) ps_off[part_dense[pk] + 1]++;
     }
     for (int32_t d = 0; d < nd; d++) ps_off[d + 1] += ps_off[d];
     const int32_t ps_total = ps_off[nd];
@@ -43,7 +47,7 @@ inline void run_q9_impl(Database* db, std::ostream& out) {
         std::vector<int32_t> fill(ps_off.begin(), ps_off.end());
         for (int32_t i = 0; i < db->n_partsupp; i++) {
             int32_t pk = db->ps_partkey[i];
-            if (pk <= n_part && match[pk]) {
+            if (pk <= n_part && test_bit(pk)) {
                 int32_t d = part_dense[pk];
                 int32_t pos = fill[d]++;
                 ps_sk[pos] = db->ps_suppkey[i];
@@ -70,38 +74,103 @@ inline void run_q9_impl(Database* db, std::ostream& out) {
         const int32_t* O2I    = db->orderkey_to_idx.data();
         const Date*    O_date = db->o_orderdate.data();
         const int32_t* S_nat  = db->s_nationkey.data();
-        const uint8_t* M      = match.data();
+        const uint64_t* MB    = mbits.data();
         const int32_t  max_ok = db->max_orderkey;
         const int64_t  nli    = db->n_lineitem;
 
+        // Phase A1: branchless left-pack part-filter over all lineitem rows.
+        // No per-row data-dependent branch → the (random) bitmap probes for
+        // consecutive rows issue concurrently (high memory-level parallelism).
+        // Also carry partkey (already loaded) so A2 need not re-read L_part.
+        std::vector<int32_t> sv_idx(nli / 12 + 16);
+        std::vector<int32_t> sv_pk(nli / 12 + 16);
+        int64_t ns = 0;
+        {
+        PROFILE_SCOPE("q9_phaseA_scan_filter");
+        int32_t* SI = sv_idx.data();
+        int32_t* SP = sv_pk.data();
+        int64_t cap = (int64_t)sv_idx.size();
         for (int64_t i = 0; i < nli; i++) {
-            TRACE_INC(li_scanned);
-            int32_t partkey = L_part[i];
-            if (!M[partkey]) continue;
+            uint32_t pk = (uint32_t)L_part[i];
+            uint64_t bit = (MB[pk >> 6] >> (pk & 63)) & 1;
+            if (ns >= cap - 1) {
+                sv_idx.resize(cap * 2); sv_pk.resize(cap * 2);
+                SI = sv_idx.data(); SP = sv_pk.data(); cap = (int64_t)sv_idx.size();
+            }
+            SI[ns] = (int32_t)i;
+            SP[ns] = (int32_t)pk;
+            ns += (int64_t)bit;
+        }
+        sv_idx.resize(ns); sv_pk.resize(ns);
+        }
+        TRACE_ADD(li_scanned, (uint64_t)nli);
 
+        // Phase A2: process survivors (sequential-order indices → streaming
+        // column reads). Cheap small-array joins: partsupp run + supplier nation.
+        const int32_t* SI = sv_idx.data();
+        const int32_t* SP = sv_pk.data();
+        std::vector<int32_t> sv_ord(ns);
+        std::vector<int8_t>  sv_nat(ns);
+        std::vector<int64_t> sv_amt(ns);
+        int64_t nv = 0;
+        {
+        PROFILE_SCOPE("q9_phaseA2_survivor_join");
+        const int64_t PFD = 32;
+        for (int64_t k = 0; k < ns; k++) {
+            if (k + PFD < ns) __builtin_prefetch(&part_dense[SP[k + PFD]], 0, 0);
+            int64_t i = SI[k];
+            int32_t partkey = SP[k];
             int32_t suppkey = L_supp[i];
             int32_t d = part_dense[partkey];
-            // Find supplycost for this (part,supplier) in the small contiguous run.
             int64_t supplycost = -1;
             for (int32_t j = ps_off[d]; j < ps_off[d + 1]; j++) {
                 if (ps_sk[j] == suppkey) { supplycost = ps_cv[j]; break; }
             }
             if (supplycost < 0) continue;
-
             int32_t orderkey = L_ord[i];
             if (orderkey > max_ok) continue;
-            int32_t o_idx = O2I[orderkey];
+            int64_t amount = L_ext[i] * (100 - L_disc[i]) - supplycost * L_qty[i];
+            sv_ord[nv] = orderkey;
+            sv_nat[nv] = (int8_t)S_nat[suppkey - 1];
+            sv_amt[nv] = amount;
+            nv++;
+        }
+        }
+
+        const int32_t* SO = sv_ord.data();
+
+        // Phase B: orderkey → order row index (random gather into ~240MB array),
+        // prefetched.
+        std::vector<int32_t> sv_oidx(nv);
+        const int64_t PFB = 48;
+        {
+        PROFILE_SCOPE("q9_phaseB_orderkey_gather");
+        for (int64_t k = 0; k < nv; k++) {
+            if (k + PFB < nv) __builtin_prefetch(&O2I[SO[k + PFB]], 0, 0);
+            int32_t ok = SO[k];
+            sv_oidx[k] = (ok <= max_ok) ? O2I[ok] : -1;
+        }
+        }
+
+        // Phase C: order row → orderdate (random gather into ~60MB array),
+        // prefetched, then accumulate.
+        const int32_t* OI = sv_oidx.data();
+        const int8_t*  SN = sv_nat.data();
+        const int64_t* SA = sv_amt.data();
+        {
+        PROFILE_SCOPE("q9_phaseC_date_agg");
+        for (int64_t k = 0; k < nv; k++) {
+            if (k + PFB < nv) {
+                int32_t pidx = OI[k + PFB];
+                if (pidx >= 0) __builtin_prefetch(&O_date[pidx], 0, 0);
+            }
+            int32_t o_idx = OI[k];
             if (o_idx < 0) continue;
-            int32_t year = epoch_to_year(O_date[o_idx]);
-
-            int32_t nation_key = S_nat[suppkey - 1];
-
             TRACE_INC(li_emitted);
-            __int128 amount = (__int128)L_ext[i] * (100 - L_disc[i])
-                            - (__int128)supplycost * L_qty[i];
-
+            int32_t year = epoch_to_year(O_date[o_idx]);
             int32_t yb = year - YEAR_BASE;
-            acc[(size_t)nation_key * NYEARS + yb] += amount;
+            acc[(size_t)SN[k] * NYEARS + yb] += SA[k];
+        }
         }
     }
     TRACE_COUNT("q9_rows_scanned", li_scanned);
