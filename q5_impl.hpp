@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
+#include <memory>
 #include <immintrin.h>
 
 inline void __attribute__((target("avx2"))) run_q5_impl(Database* db, std::ostream& out) {
@@ -56,10 +57,13 @@ inline void __attribute__((target("avx2"))) run_q5_impl(Database* db, std::ostre
 
         // Phase 1: AVX2 date filter, left-packing passing order indices.
         // Range check via (unsigned)(d - lo) < (hi - lo).
-        std::vector<int32_t> pass(db->n_orders + 8);
-        int32_t* __restrict pbuf = pass.data();
+        // new[] (no value-init) avoids zeroing/faulting the whole buffer; only
+        // the ~npass entries actually written are touched.
+        std::unique_ptr<int32_t[]> pass(new int32_t[db->n_orders + 8]);
+        int32_t* __restrict pbuf = pass.get();
         size_t npass = 0;
         {
+            PROFILE_SCOPE("q5_p1_datefilter");
             const int32_t* tbl = q4_leftpack_table();
             const uint32_t range = (uint32_t)(date_hi - date_lo);
             const __m256i vlo = _mm256_set1_epi32(date_lo);
@@ -88,12 +92,13 @@ inline void __attribute__((target("avx2"))) run_q5_impl(Database* db, std::ostre
         // Phase 2: prefetched gather of customer nationkey, filter to AFRICA.
         // Order-index reads (o_custkey/o_orderkey at ascending pbuf) stay cached;
         // only the c_nationkey gather (6MB, scattered) is prefetched.
-        std::vector<int32_t> q_ok(npass);
-        std::vector<int32_t> q_nat(npass);
-        int32_t* __restrict qok = q_ok.data();
-        int32_t* __restrict qnat = q_nat.data();
+        std::unique_ptr<int32_t[]> q_ok(new int32_t[npass + 1]);
+        std::unique_ptr<int32_t[]> q_nat(new int32_t[npass + 1]);
+        int32_t* __restrict qok = q_ok.get();
+        int32_t* __restrict qnat = q_nat.get();
         size_t nq = 0;
         {
+            PROFILE_SCOPE("q5_p2_nationgather");
             const int PA = 64;
             for (size_t k = 0; k < npass; k++) {
                 if (k + PA < npass)
@@ -107,9 +112,10 @@ inline void __attribute__((target("avx2"))) run_q5_impl(Database* db, std::ostre
         }
 
         // Phase 3: gather lineitem CSR range per qualifying order, prefetched.
-        std::vector<Database::LineitemRange> q_rng(nq);
-        Database::LineitemRange* __restrict qrng = q_rng.data();
+        std::unique_ptr<Database::LineitemRange[]> q_rng(new Database::LineitemRange[nq + 1]);
+        Database::LineitemRange* __restrict qrng = q_rng.get();
         {
+            PROFILE_SCOPE("q5_p3_rangegather");
             const int PA = 64;
             for (size_t k = 0; k < nq; k++) {
                 if (k + PA < nq) __builtin_prefetch(&ranges[qok[k + PA]], 0, 1);
@@ -121,6 +127,7 @@ inline void __attribute__((target("avx2"))) run_q5_impl(Database* db, std::ostre
         // lineitem columns of upcoming orders straight from the compact range
         // array (no dependent load) for maximum memory-level parallelism.
         {
+            PROFILE_SCOPE("q5_p4_liprobe");
             const int PB = 48;
             for (size_t k = 0; k < nq; k++) {
                 if (k + PB < nq) {
