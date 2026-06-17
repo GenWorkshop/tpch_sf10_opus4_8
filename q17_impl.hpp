@@ -3,6 +3,7 @@
 #include "query_utils.hpp"
 #include <ostream>
 #include <vector>
+#include <cstring>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -22,11 +23,26 @@ inline void run_q17_impl(Database* db, std::ostream& out) {
     // the wide array is only touched on the rare (~0.1%) match.
     std::vector<uint64_t> match_bits((np >> 6) + 2, 0);
     int32_t n_match = 0;
-    for (int32_t i = 0; i < np; i++) {
-        if (db->p_brand[i] == "Brand#13" && db->p_container[i] == "MED BOX") {
-            int32_t pk = i + 1;
-            part_dense[pk] = n_match++;
-            match_bits[pk >> 6] |= (uint64_t)1 << (pk & 63);
+    {
+        PROFILE_SCOPE("q17_part_filter");
+        // p_brand is always exactly "Brand#NN" (8 bytes, SSO-inline), so probe
+        // it with a single 8-byte word compare instead of std::string::operator==.
+        // Only the ~1/25 brand matches pay the (rarer) container compare.
+        const std::string* __restrict pb = db->p_brand.data();
+        const std::string* __restrict pc = db->p_container.data();
+        uint64_t want_brand;
+        std::memcpy(&want_brand, "Brand#13", 8);
+        for (int32_t i = 0; i < np; i++) {
+            uint64_t bw;
+            std::memcpy(&bw, pb[i].data(), 8);
+            if (bw == want_brand) {
+                const std::string& c = pc[i];
+                if (c.size() == 7 && std::memcmp(c.data(), "MED BOX", 7) == 0) {
+                    int32_t pk = i + 1;
+                    part_dense[pk] = n_match++;
+                    match_bits[pk >> 6] |= (uint64_t)1 << (pk & 63);
+                }
+            }
         }
     }
 
