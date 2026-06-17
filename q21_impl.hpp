@@ -26,9 +26,13 @@ __attribute__((target("avx2")))
 static inline void q21_scan_sorted(
     const int32_t* __restrict ok_col, const int32_t* __restrict sk_col,
     const Date* __restrict rcpt, const Date* __restrict cmit, int64_t n,
-    const int32_t* __restrict o_okey, const char* __restrict o_stat,
+    const char* __restrict o_stat,
     int32_t n_ord, const uint8_t* __restrict is_russia,
     int64_t* __restrict supp_numwait) {
+    // orders and lineitem are both clustered by orderkey and every order has
+    // at least one lineitem (TPC-H), so the k-th lineitem run is exactly the
+    // k-th order: o_orderstatus is read sequentially by run index, and the
+    // o_orderkey column need not be touched at all.
     int32_t oj = 0;
     int64_t i = 0;
     while (i < n) {
@@ -50,9 +54,7 @@ static inline void q21_scan_sorted(
         }
         if (!done) while (e < n && ok_col[e] == ok) e++;
 
-        while (oj < n_ord && o_okey[oj] < ok) oj++;
-        const bool isF = (oj < n_ord && o_okey[oj] == ok && o_stat[oj] == 'F');
-        if (isF) {
+        if (o_stat[oj] == 'F') {
             int32_t min_sk = INT32_MAX, max_sk = 0;
             int32_t late_min = INT32_MAX, late_max = 0;
             for (int64_t j = i; j < e; j++) {    // counted loop, no boundary branch
@@ -70,6 +72,7 @@ static inline void q21_scan_sorted(
                 supp_numwait[late_min]++;
         }
         i = e;
+        oj++;
     }
 }
 
@@ -103,7 +106,7 @@ inline void run_q21_impl(Database* db, std::ostream& out) {
         // reduction (multi == max_sk!=min_sk; sole late supplier == late_min).
         PROFILE_SCOPE("q21_lineitem_scan_join");
         q21_scan_sorted(ok_col, sk_col, rcpt, cmit, n,
-                        db->o_orderkey.data(), db->o_orderstatus.data(),
+                        db->o_orderstatus.data(),
                         db->n_orders, is_russia.data(), supp_numwait.data());
         TRACE_COUNT("q21_rows_scanned", li_scanned);
         TRACE_COUNT("q21_join_rows_emitted", li_emitted);
