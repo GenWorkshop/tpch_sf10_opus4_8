@@ -40,12 +40,19 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
         // otherwise dominates the 60M-row scan.
         std::unique_ptr<int32_t[]> survivors(new int32_t[n]);
         int64_t count = 0;
+        {
+        PROFILE_SCOPE("q12_pass1_receiptdate_filter");
         for (int64_t i = 0; i < n; i++) {
             TRACE_INC(li_scanned);
             const Date rd = receiptdate[i];
+            const Date cd = commitdate[i];
+            const Date sd = shipdate[i];
             survivors[count] = (int32_t)i;
-            count += (rd >= date_lo) & (rd < date_hi);
+            count += (rd >= date_lo) & (rd < date_hi) & (cd < rd) & (sd < cd);
         }
+        }
+
+        PROFILE_SCOPE("q12_pass2_probe");
 
         // Pass 2: only the ~1/7 receiptdate survivors pay for the remaining
         // (cache-unfriendly) date, shipmode and orders probes.  Survivor indices
@@ -60,8 +67,6 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
         for (int64_t s = 0; s < count; s++) {
             if (s + PF < count) {
                 const int32_t j = survivors[s + PF];
-                __builtin_prefetch(&commitdate[j], 0, 1);
-                __builtin_prefetch(&shipdate[j], 0, 1);
                 __builtin_prefetch(&shipmode[j], 0, 1);
                 __builtin_prefetch(&orderkey[j], 0, 1);
             }
@@ -82,10 +87,6 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
                 }
             }
             const int32_t i = survivors[s];
-            const Date rd = receiptdate[i];
-            const Date cd = commitdate[i];
-            if (cd >= rd) continue;
-            if (shipdate[i] >= cd) continue;
 
             // l_shipmode in ('MAIL', 'FOB')
             const std::string& mode = shipmode[i];
