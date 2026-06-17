@@ -41,14 +41,14 @@ inline void run_q16_impl(Database* db, std::ostream& out) {
         std::string p_brand;
         std::string p_type;
         int32_t p_size;
+        int32_t brand_code;
+        int32_t type_id;
     };
     std::vector<GroupInfo> groups;
     groups.reserve(1 << 15);
 
-    // Group key is packed as ((brand_code*256 + type_id)*64 + size) into a flat
-    // array, avoiding hashing of a long concatenated string per qualifying part.
-    // type_id is interned through a tiny map (<=150 distinct TPC-H types, stays
-    // hot in cache).  brand_code is parsed directly from "Brand#MN".
+    // Group key packed as ((brand_code*256 + type_id)*64 + size) into a flat
+    // array, avoiding hashing a long concatenated string per qualifying part.
     std::unordered_map<std::string, int32_t> type_intern;
     type_intern.reserve(256);
     std::vector<int32_t> group_of(1 << 21, -1);
@@ -57,12 +57,24 @@ inline void run_q16_impl(Database* db, std::ostream& out) {
 
     {
     PROFILE_SCOPE("q16_part_filter");
-    for (int32_t i = 0; i < db->n_part; i++) {
-        int32_t sz = db->p_size[i];
+    const std::string* PB = db->p_brand.data();
+    const std::string* PT = db->p_type.data();
+    const int32_t* PS = db->p_size.data();
+    const int32_t n_part = db->n_part;
+    constexpr int PF = 64;
+    for (int32_t i = 0; i < n_part; i++) {
+        // Hide p_type heap latency: prefetch the string payload of an upcoming
+        // part, but only for ones that pass the cheap (sequential) size filter.
+        int32_t pj = i + PF;
+        if (pj < n_part && size_ok_arr[PS[pj]]) {
+            __builtin_prefetch(PT[pj].data(), 0, 1);
+        }
+
+        int32_t sz = PS[i];
         if (!size_ok_arr[sz]) continue;
-        const std::string& br = db->p_brand[i];
+        const std::string& br = PB[i];
         if (br == "Brand#31") continue;
-        const std::string& ty = db->p_type[i];
+        const std::string& ty = PT[i];
         if (ty.size() >= 14 && ty.compare(0, 14, "SMALL POLISHED") == 0) continue;
 
         int32_t bc = (int32_t)(br[6] - '0') * 10 + (int32_t)(br[7] - '0');
@@ -74,7 +86,7 @@ inline void run_q16_impl(Database* db, std::ostream& out) {
         if (gid < 0) {
             gid = (int32_t)groups.size();
             group_of[packed] = gid;
-            groups.push_back({br, ty, sz});
+            groups.push_back({br, ty, sz, bc, tid});
         }
         part_gid[i + 1] = gid;
     }
@@ -135,18 +147,35 @@ inline void run_q16_impl(Database* db, std::ostream& out) {
     TRACE_COUNT("q16_groups_created", (uint64_t)groups.size());
 
     // Build results, dropping empty groups (no qualifying partsupp rows).
+    // ORDER BY supplier_cnt DESC, p_brand ASC, p_type ASC, p_size ASC.
+    // Brand is fixed-width "Brand#NN" so brand_code preserves string order.
+    // Pre-rank the (<=150) distinct p_type strings so the sort uses integer
+    // keys only, avoiding pointer-chasing string compares over scattered groups.
+    std::vector<int32_t> type_rank(type_intern.size());
+    {
+        std::vector<std::pair<const std::string*, int32_t>> tv;
+        tv.reserve(type_intern.size());
+        for (auto& kv : type_intern) tv.push_back({&kv.first, kv.second});
+        std::sort(tv.begin(), tv.end(),
+                  [](const auto& a, const auto& b) { return *a.first < *b.first; });
+        for (int32_t r = 0; r < (int32_t)tv.size(); r++) type_rank[tv[r].second] = r;
+    }
+
     struct ResultRow {
         const std::string* p_brand;
         const std::string* p_type;
         int32_t p_size;
         int64_t supplier_cnt;
+        int32_t brand_code;
+        int32_t type_rank;
     };
     std::vector<ResultRow> results;
     results.reserve(groups.size());
     for (size_t g = 0; g < groups.size(); g++) {
         if (supplier_cnt[g] == 0) continue;
-        results.push_back({&groups[g].p_brand, &groups[g].p_type,
-                           groups[g].p_size, supplier_cnt[g]});
+        const GroupInfo& gi = groups[g];
+        results.push_back({&gi.p_brand, &gi.p_type, gi.p_size, supplier_cnt[g],
+                           gi.brand_code, type_rank[gi.type_id]});
     }
     TRACE_COUNT("q16_agg_rows_emitted", (uint64_t)results.size());
 
@@ -155,24 +184,33 @@ inline void run_q16_impl(Database* db, std::ostream& out) {
         PROFILE_SCOPE("q16_sort");
         std::sort(results.begin(), results.end(), [](const ResultRow& a, const ResultRow& b) {
             if (a.supplier_cnt != b.supplier_cnt) return a.supplier_cnt > b.supplier_cnt;
-            int cmp = a.p_brand->compare(*b.p_brand);
-            if (cmp != 0) return cmp < 0;
-            cmp = a.p_type->compare(*b.p_type);
-            if (cmp != 0) return cmp < 0;
+            if (a.brand_code != b.brand_code) return a.brand_code < b.brand_code;
+            if (a.type_rank != b.type_rank) return a.type_rank < b.type_rank;
             return a.p_size < b.p_size;
         });
     }
     TRACE_COUNT("q16_sort_rows_out", (uint64_t)results.size());
 
     PROFILE_SCOPE("q16_output");
-    write_csv_header(out, {"p_brand","p_type","p_size","supplier_cnt"});
+    std::string buf;
+    buf.reserve(results.size() * 48 + 64);
+    buf += "p_brand,p_type,p_size,supplier_cnt\n";
+    char tmp[24];
+    auto append_uint = [&](uint64_t v) {
+        char* p = tmp + sizeof(tmp);
+        do { *--p = char('0' + v % 10); v /= 10; } while (v);
+        buf.append(p, tmp + sizeof(tmp) - p);
+    };
     for (auto& r : results) {
-        write_csv_row(out, {
-            *r.p_brand,
-            *r.p_type,
-            std::to_string(r.p_size),
-            std::to_string(r.supplier_cnt)
-        });
+        buf.append(*r.p_brand);
+        buf.push_back(',');
+        buf.append(*r.p_type);
+        buf.push_back(',');
+        append_uint((uint64_t)r.p_size);
+        buf.push_back(',');
+        append_uint((uint64_t)r.supplier_cnt);
+        buf.push_back('\n');
     }
+    out.write(buf.data(), (std::streamsize)buf.size());
     TRACE_COUNT("q16_query_output_rows", (uint64_t)results.size());
 }
