@@ -1,11 +1,8 @@
 {
   "step": 3,
-  "completed_queries": [],
-  "current_query": "q1",
-  "completed_stages": [
-    "sample_plan",
-    "trace",
-    "expert_knowledge",
-    "human_reference"
-  ]
+  "completed_queries": [
+    "q1"
+  ],
+  "current_query": "q2",
+  "completed_stages": []
 }
