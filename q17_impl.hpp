@@ -17,10 +17,16 @@ inline void run_q17_impl(Database* db, std::ostream& out) {
     // compact arrays addressed directly by partkey (no hashing on the hot path).
     const int32_t np = db->n_part;
     std::vector<int32_t> part_dense(np + 1, -1); // partkey(1-based) -> dense slot
+    // Compact 1-bit-per-part presence filter (~np/8 bytes) so the 60M-row hot
+    // scan probes a small L2-resident bitmap instead of the 8MB dense array;
+    // the wide array is only touched on the rare (~0.1%) match.
+    std::vector<uint64_t> match_bits((np >> 6) + 2, 0);
     int32_t n_match = 0;
     for (int32_t i = 0; i < np; i++) {
         if (db->p_brand[i] == "Brand#13" && db->p_container[i] == "MED BOX") {
-            part_dense[i + 1] = n_match++;
+            int32_t pk = i + 1;
+            part_dense[pk] = n_match++;
+            match_bits[pk >> 6] |= (uint64_t)1 << (pk & 63);
         }
     }
 
@@ -39,15 +45,17 @@ inline void run_q17_impl(Database* db, std::ostream& out) {
         const int32_t* __restrict lp = db->l_partkey.data();
         const int64_t* __restrict lq = db->l_quantity.data();
         const int64_t* __restrict le = db->l_extendedprice.data();
+        const uint64_t* __restrict mb = match_bits.data();
         const int64_t n = db->n_lineitem;
         sel_dense.reserve(1u << 21);
         sel_qty.reserve(1u << 21);
         sel_price.reserve(1u << 21);
         for (int64_t i = 0; i < n; i++) {
             TRACE_INC(scan1);
-            int32_t d = part_dense[lp[i]];
-            if (d >= 0) {
+            uint32_t pk = (uint32_t)lp[i];
+            if ((mb[pk >> 6] >> (pk & 63)) & 1) {
                 TRACE_INC(scan1_emit);
+                int32_t d = part_dense[pk];
                 int32_t q = (int32_t)lq[i];
                 sum_qty[d] += q;
                 cnt[d]++;
