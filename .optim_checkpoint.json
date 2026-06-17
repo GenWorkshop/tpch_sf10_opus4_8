@@ -25,6 +25,8 @@
   ],
   "current_query": "q22",
   "completed_stages": [
-    "sample_plan"
+    "sample_plan",
+    "trace",
+    "expert_knowledge"
   ]
 }
