@@ -8,6 +8,7 @@
 #include <unordered_set>
 #include <climits>
 #include <cstdint>
+#include <cstdio>
 
 inline void run_q2_impl(Database* db, std::ostream& out) {
     PROFILE_SCOPE("q2_total");
@@ -129,19 +130,74 @@ inline void run_q2_impl(Database* db, std::ostream& out) {
     TRACE_COUNT("q2_sort_rows_out", (uint64_t)results.size());
 
     PROFILE_SCOPE("q2_output");
-    write_csv_header(out, {"s_acctbal","s_name","n_name","p_partkey","p_mfgr","s_address","s_phone","s_comment"});
 
-    for (auto& r : results) {
-        write_csv_row(out, {
-            fmt_money(r.s_acctbal, 2),
-            csv_quote(db->s_name[r.s_idx]),
-            csv_quote(db->n_name[r.n_idx]),
-            std::to_string(r.p_idx + 1),
-            csv_quote(db->p_mfgr[r.p_idx]),
-            csv_quote(db->s_address[r.s_idx]),
-            csv_quote(db->s_phone[r.s_idx]),
-            csv_quote(db->s_comment[r.s_idx])
-        });
+    // Manual single-buffer formatting + software prefetch of the scattered
+    // per-row string columns (s_*/p_mfgr live at random indices after sorting).
+    std::string buf;
+    buf.reserve(96 + (size_t)results.size() * 160);
+    buf += "s_acctbal,s_name,n_name,p_partkey,p_mfgr,s_address,s_phone,s_comment\n";
+
+    const std::string* __restrict s_name = db->s_name.data();
+    const std::string* __restrict s_addr = db->s_address.data();
+    const std::string* __restrict s_phone = db->s_phone.data();
+    const std::string* __restrict s_comm = db->s_comment.data();
+    const std::string* __restrict p_mfgr = db->p_mfgr.data();
+    const std::string* __restrict n_name = db->n_name.data();
+    const Result* __restrict rs = results.data();
+    const size_t nrows = results.size();
+
+    auto append_csv = [&buf](const std::string& s) {
+        const char* d = s.data();
+        size_t n = s.size();
+        bool needs_quote = false;
+        for (size_t k = 0; k < n; k++) {
+            char c = d[k];
+            if (c == ',' || c == '"' || c == '\n' || c == '\r' || c == '\\') { needs_quote = true; break; }
+        }
+        if (!needs_quote) { buf.append(d, n); return; }
+        buf.push_back('"');
+        for (size_t k = 0; k < n; k++) {
+            char c = d[k];
+            if (c == '"') buf.push_back('"');
+            buf.push_back(c);
+        }
+        buf.push_back('"');
+    };
+    auto append_money = [&buf](int64_t cents) {
+        char t[24];
+        int n;
+        if (cents < 0) n = snprintf(t, sizeof(t), "-%lld.%02d", -cents / 100, (int)(-cents % 100));
+        else           n = snprintf(t, sizeof(t),  "%lld.%02d",  cents / 100, (int)( cents % 100));
+        buf.append(t, n);
+    };
+
+    constexpr size_t PD_OBJ = 16;  // distance to prefetch the string control block
+    constexpr size_t PD_DAT = 6;   // distance to prefetch the heap char data
+    char numtmp[24];
+    for (size_t i = 0; i < nrows; i++) {
+        if (i + PD_OBJ < nrows) {
+            const Result& rf = rs[i + PD_OBJ];
+            __builtin_prefetch(s_name + rf.s_idx, 0, 1);
+            __builtin_prefetch(s_comm + rf.s_idx, 0, 1);
+            __builtin_prefetch(s_addr + rf.s_idx, 0, 1);
+            __builtin_prefetch(p_mfgr + rf.p_idx, 0, 1);
+        }
+        if (i + PD_DAT < nrows) {
+            const Result& rn = rs[i + PD_DAT];
+            __builtin_prefetch(s_name[rn.s_idx].data(), 0, 1);
+            __builtin_prefetch(s_comm[rn.s_idx].data(), 0, 1);
+            __builtin_prefetch(s_addr[rn.s_idx].data(), 0, 1);
+        }
+        const Result r = rs[i];
+        append_money(r.s_acctbal);     buf.push_back(',');
+        append_csv(s_name[r.s_idx]);   buf.push_back(',');
+        append_csv(n_name[r.n_idx]);   buf.push_back(',');
+        buf.append(numtmp, snprintf(numtmp, sizeof(numtmp), "%d", r.p_idx + 1)); buf.push_back(',');
+        append_csv(p_mfgr[r.p_idx]);   buf.push_back(',');
+        append_csv(s_addr[r.s_idx]);   buf.push_back(',');
+        append_csv(s_phone[r.s_idx]);  buf.push_back(',');
+        append_csv(s_comm[r.s_idx]);   buf.push_back('\n');
     }
+    out.write(buf.data(), (std::streamsize)buf.size());
     TRACE_COUNT("q2_query_output_rows", (uint64_t)results.size());
 }
