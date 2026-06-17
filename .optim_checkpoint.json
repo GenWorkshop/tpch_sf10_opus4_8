@@ -9,6 +9,7 @@
   "current_query": "q5",
   "completed_stages": [
     "sample_plan",
-    "trace"
+    "trace",
+    "expert_knowledge"
   ]
 }
