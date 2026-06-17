@@ -20,5 +20,8 @@
     "q17"
   ],
   "current_query": "q18",
-  "completed_stages": []
+  "completed_stages": [
+    "sample_plan",
+    "trace"
+  ]
 }
