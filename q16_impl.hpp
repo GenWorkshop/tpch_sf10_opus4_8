@@ -15,7 +15,9 @@ inline void run_q16_impl(Database* db, std::ostream& out) {
 
     // Bad suppliers: s_comment LIKE '%Customer%Complaints%' -> dense bool by suppkey
     std::vector<uint8_t> bad_supplier(db->n_supplier + 1, 0);
-    for (int32_t i = 0; i < db->n_supplier; i++) {
+    {
+        PROFILE_SCOPE("q16_bad_supplier");
+        for (int32_t i = 0; i < db->n_supplier; i++) {
         const std::string& c = db->s_comment[i];
         auto pos = c.find("Customer");
         if (pos != std::string::npos &&
@@ -23,13 +25,14 @@ inline void run_q16_impl(Database* db, std::ostream& out) {
             bad_supplier[i + 1] = 1;
         }
     }
+    }
 
-    auto is_valid_size = [](int32_t s) -> bool {
-        switch (s) {
-            case 6: case 7: case 10: case 14:
-            case 18: case 22: case 25: case 50: return true;
-            default: return false;
-        }
+    static const bool size_ok_arr[51] = {
+        false,false,false,false,false,false,true,true,false,false,true,   // 0..10
+        false,false,false,true,false,false,false,true,false,false,        // 11..20
+        false,true,false,false,true,false,false,false,false,false,        // 21..30
+        false,false,false,false,false,false,false,false,false,false,      // 31..40
+        false,false,false,false,false,false,false,false,false,true        // 41..50
     };
 
     // Part filter + group assignment.
@@ -40,43 +43,50 @@ inline void run_q16_impl(Database* db, std::ostream& out) {
         int32_t p_size;
     };
     std::vector<GroupInfo> groups;
-    std::unordered_map<std::string, int32_t> group_id;
-    group_id.reserve(1 << 16);
+    groups.reserve(1 << 15);
+
+    // Group key is packed as ((brand_code*256 + type_id)*64 + size) into a flat
+    // array, avoiding hashing of a long concatenated string per qualifying part.
+    // type_id is interned through a tiny map (<=150 distinct TPC-H types, stays
+    // hot in cache).  brand_code is parsed directly from "Brand#MN".
+    std::unordered_map<std::string, int32_t> type_intern;
+    type_intern.reserve(256);
+    std::vector<int32_t> group_of(1 << 21, -1);
 
     std::vector<int32_t> part_gid(db->n_part + 1, -1);
 
-    std::string key;
+    {
+    PROFILE_SCOPE("q16_part_filter");
     for (int32_t i = 0; i < db->n_part; i++) {
         int32_t sz = db->p_size[i];
-        if (!is_valid_size(sz)) continue;
+        if (!size_ok_arr[sz]) continue;
         const std::string& br = db->p_brand[i];
         if (br == "Brand#31") continue;
         const std::string& ty = db->p_type[i];
         if (ty.size() >= 14 && ty.compare(0, 14, "SMALL POLISHED") == 0) continue;
 
-        key.clear();
-        key.append(br);
-        key.push_back('\0');
-        key.append(ty);
-        key.push_back('\0');
-        key.append(reinterpret_cast<const char*>(&sz), sizeof(sz));
+        int32_t bc = (int32_t)(br[6] - '0') * 10 + (int32_t)(br[7] - '0');
+        auto ins = type_intern.try_emplace(ty, (int32_t)type_intern.size());
+        int32_t tid = ins.first->second;
+        int32_t packed = (bc * 256 + tid) * 64 + sz;
 
-        auto it = group_id.find(key);
-        int32_t gid;
-        if (it == group_id.end()) {
+        int32_t gid = group_of[packed];
+        if (gid < 0) {
             gid = (int32_t)groups.size();
-            group_id.emplace(key, gid);
+            group_of[packed] = gid;
             groups.push_back({br, ty, sz});
-        } else {
-            gid = it->second;
         }
         part_gid[i + 1] = gid;
     }
+    }
 
-    // Partsupp scan/join: emit packed (gid, suppkey) keys for distinct counting.
-    // high 32 bits = gid, low 32 bits = suppkey.
-    std::vector<uint64_t> pairs;
-    pairs.reserve(db->n_partsupp);
+    // Partsupp scan/join: collect surviving (gid, suppkey) pairs.
+    const int32_t G = (int32_t)groups.size();
+    std::vector<int32_t> pair_gid;
+    std::vector<int32_t> pair_sk;
+    pair_gid.reserve(1u << 21);
+    pair_sk.reserve(1u << 21);
+    std::vector<int32_t> gcount(G + 1, 0);
     {
         PROFILE_SCOPE("q16_partsupp_scan_join_agg");
         const int32_t* psp = db->ps_partkey.data();
@@ -91,24 +101,35 @@ inline void run_q16_impl(Database* db, std::ostream& out) {
             int32_t sk = pss[i];
             if (bad[sk]) continue;
             TRACE_INC(ps_emitted);
-            pairs.push_back(((uint64_t)(uint32_t)gid << 32) | (uint32_t)sk);
+            pair_gid.push_back(gid);
+            pair_sk.push_back(sk);
+            gcount[gid + 1]++;
         }
     }
     TRACE_COUNT("q16_rows_scanned", ps_scanned);
     TRACE_COUNT("q16_rows_emitted", ps_emitted);
     TRACE_COUNT("q16_agg_rows_in", ps_emitted);
 
-    // Distinct count per group via sort + unique scan.
-    std::sort(pairs.begin(), pairs.end());
-    std::vector<int64_t> supplier_cnt(groups.size(), 0);
+    // Distinct count per group via counting-sort bucketing + stamp dedup
+    // (avoids an O(n log n) comparison sort over ~1.2M pairs).
+    std::vector<int64_t> supplier_cnt(G, 0);
     {
-        size_t m = pairs.size();
-        for (size_t i = 0; i < m; ) {
-            uint64_t v = pairs[i];
-            supplier_cnt[v >> 32]++;
-            size_t j = i + 1;
-            while (j < m && pairs[j] == v) j++;
-            i = j;
+        PROFILE_SCOPE("q16_distinct_count");
+        const size_t m = pair_gid.size();
+        for (int32_t g = 0; g < G; g++) gcount[g + 1] += gcount[g];
+        std::vector<int32_t> offset(gcount.begin(), gcount.end());
+        std::vector<int32_t> bucket(m);
+        for (size_t i = 0; i < m; i++) {
+            bucket[offset[pair_gid[i]]++] = pair_sk[i];
+        }
+        std::vector<int32_t> seen(db->n_supplier + 1, -1);
+        for (int32_t g = 0; g < G; g++) {
+            int64_t c = 0;
+            for (int32_t k = gcount[g]; k < gcount[g + 1]; k++) {
+                int32_t sk = bucket[k];
+                if (seen[sk] != g) { seen[sk] = g; c++; }
+            }
+            supplier_cnt[g] = c;
         }
     }
     TRACE_COUNT("q16_groups_created", (uint64_t)groups.size());
