@@ -40,6 +40,8 @@ inline void run_q20_impl(Database* db, std::ostream& out) {
     // ps_availqty is integer, sum is scale 2
     // Condition: ps_availqty > 0.5 * (sum_qty / 100)  [convert sum from scale 2 to real]
     // Equivalent: ps_availqty * 200 > sum_qty
+    // NOTE: if no lineitem exists for (partkey,suppkey) in the date range, the subquery
+    // returns NULL and the comparison is FALSE, so we skip those.
     std::unordered_set<int32_t> qualifying_suppkeys;
     for (int32_t i = 0; i < db->n_partsupp; i++) {
         int32_t pk = db->ps_partkey[i];
@@ -47,7 +49,9 @@ inline void run_q20_impl(Database* db, std::ostream& out) {
 
         int64_t key = (int64_t)pk * 1000000LL + db->ps_suppkey[i];
         auto it = ps_qty_sum.find(key);
-        int64_t sum_qty = (it != ps_qty_sum.end()) ? it->second : 0;
+        if (it == ps_qty_sum.end()) continue; // no lineitem → NULL → skip
+
+        int64_t sum_qty = it->second;
 
         // ps_availqty > 0.5 * sum(l_quantity)
         // ps_availqty is plain integer, l_quantity is scale 2
