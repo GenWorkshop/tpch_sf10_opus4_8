@@ -52,8 +52,8 @@ inline void run_q4_impl(Database* db, std::ostream& out) {
         {
             PROFILE_SCOPE("q4_orders_scan_agg");
             const int n = (int)npass;
-            const int PF1 = 64;  // prefetch CSR boundaries this far ahead
-            const int PF2 = 32;  // prefetch lineitem dates this far ahead
+            const int PF1 = 96;  // prefetch CSR boundaries this far ahead
+            const int PF2 = 48;  // prefetch lineitem dates this far ahead
             for (int k = 0; k < n; k++) {
                 if (k + PF1 < n) {
                     int32_t fok = okey[pbuf[k + PF1]];
