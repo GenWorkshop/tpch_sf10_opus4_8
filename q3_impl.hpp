@@ -7,6 +7,9 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <algorithm>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 // Format epoch days as YYYY-MM-DD
 inline std::string format_date(int32_t days) {
@@ -85,44 +88,84 @@ inline void run_q3_impl(Database* db, std::ostream& out) {
     std::vector<ResultRow> results;
     results.reserve(qcount / 8 + 16);
 
-    // Step 3: Scan lineitem; filter l_shipdate and gate on qualifies-bitmap.
-    // Branchless: lineitem is clustered by orderkey, so the bitmap is touched
-    // in streaming order (cache-friendly), letting us drop the ~50% shipdate
-    // branch entirely. Because lineitem rows for an order are contiguous, we
-    // aggregate revenue per orderkey with a run-length pass — no per-hit random
-    // accumulator gather. orderdate/shippriority are looked up once per group.
+    // Step 3: Scan lineitem. Decoupled, Neumann/Jasny-style: a fully
+    // vectorizable SELECT phase (shipdate filter + bitmap probe, no
+    // loop-carried dependency) collects the rare hit positions, then a cheap
+    // scalar phase reads the wide money columns only for those hits and
+    // run-length aggregates per (contiguous) orderkey.
+    std::vector<int32_t> hits;
+    hits.reserve((size_t)db->n_lineitem / 16 + 1024);
     {
         PROFILE_SCOPE("q3_lineitem_scan_join_agg");
         const Date* __restrict l_shipdate = db->l_shipdate.data();
         const int32_t* __restrict l_orderkey = db->l_orderkey.data();
-        const int64_t* __restrict l_extendedprice = db->l_extendedprice.data();
-        const int64_t* __restrict l_discount = db->l_discount.data();
         const uint64_t* __restrict qb = qbits.data();
-        const int32_t* __restrict ok2idx = db->orderkey_to_idx.data();
-        const Date* __restrict o_orderdate = db->o_orderdate.data();
-        const int32_t* __restrict o_shippriority = db->o_shippriority.data();
         const int64_t n = db->n_lineitem;
-        int32_t cur_ok = -1;
-        int64_t cur_rev = 0;
-        for (int64_t i = 0; i < n; i++) {
-            TRACE_INC(li_scanned);
+        int64_t i = 0;
+#ifdef __AVX2__
+        // 32-bit view of the orderkey bitmap for 8-wide gather.
+        const uint32_t* __restrict qb32 = reinterpret_cast<const uint32_t*>(qb);
+        const __m256i vfilter = _mm256_set1_epi32(date_filter);
+        const __m256i vone = _mm256_set1_epi32(1);
+        const __m256i vmask5 = _mm256_set1_epi32(31);
+        int32_t* __restrict hp = hits.data();
+        size_t hc = 0;
+        for (; i + 8 <= n; i += 8) {
+            __m256i sd = _mm256_loadu_si256((const __m256i*)(l_shipdate + i));
+            __m256i ship = _mm256_cmpgt_epi32(sd, vfilter);
+            __m256i ok = _mm256_loadu_si256((const __m256i*)(l_orderkey + i));
+            __m256i widx = _mm256_srli_epi32(ok, 5);
+            __m256i words = _mm256_i32gather_epi32((const int*)qb32, widx, 4);
+            __m256i bitpos = _mm256_and_si256(ok, vmask5);
+            __m256i bit = _mm256_and_si256(_mm256_srlv_epi32(words, bitpos), vone);
+            __m256i bitm = _mm256_cmpeq_epi32(bit, vone);
+            __m256i hitv = _mm256_and_si256(ship, bitm);
+            unsigned m = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(hitv));
+            // hits are very rare (~0.5%), so this is almost always skipped.
+            while (m) {
+                int lane = __builtin_ctz(m);
+                m &= m - 1;
+                hp[hc++] = (int32_t)(i + lane);
+            }
+        }
+        hits.resize(hc);
+#endif
+        for (; i < n; i++) {
             uint32_t ok = (uint32_t)l_orderkey[i];
             unsigned pass = (unsigned)(l_shipdate[i] > date_filter);
             unsigned hit = pass & (unsigned)((qb[ok >> 6] >> (ok & 63)) & 1);
-            if (hit) {
-                TRACE_INC(li_emitted);
-                int64_t rev = l_extendedprice[i] * (100 - l_discount[i]);
-                if ((int32_t)ok == cur_ok) {
-                    cur_rev += rev;
-                } else {
-                    if (cur_ok >= 0) {
-                        int32_t o_idx = ok2idx[cur_ok];
-                        results.push_back({cur_ok, cur_rev,
-                                           o_orderdate[o_idx], o_shippriority[o_idx]});
-                    }
-                    cur_ok = (int32_t)ok;
-                    cur_rev = rev;
+            if (hit) hits.push_back((int32_t)i);
+        }
+    }
+    TRACE_COUNT("q3_rows_scanned", (uint64_t)db->n_lineitem);
+    TRACE_COUNT("q3_join_rows_emitted", (uint64_t)hits.size());
+    TRACE_COUNT("q3_agg_rows_in", (uint64_t)hits.size());
+
+    // Aggregate the collected hits. hit indices are increasing, so lineitem
+    // rows for one order are contiguous -> run-length sum, one group lookup
+    // per distinct orderkey.
+    {
+        const int32_t* __restrict l_orderkey = db->l_orderkey.data();
+        const int64_t* __restrict l_extendedprice = db->l_extendedprice.data();
+        const int64_t* __restrict l_discount = db->l_discount.data();
+        const int32_t* __restrict ok2idx = db->orderkey_to_idx.data();
+        const Date* __restrict o_orderdate = db->o_orderdate.data();
+        const int32_t* __restrict o_shippriority = db->o_shippriority.data();
+        int32_t cur_ok = -1;
+        int64_t cur_rev = 0;
+        for (int32_t idx : hits) {
+            uint32_t ok = (uint32_t)l_orderkey[idx];
+            int64_t rev = l_extendedprice[idx] * (100 - l_discount[idx]);
+            if ((int32_t)ok == cur_ok) {
+                cur_rev += rev;
+            } else {
+                if (cur_ok >= 0) {
+                    int32_t o_idx = ok2idx[cur_ok];
+                    results.push_back({cur_ok, cur_rev,
+                                       o_orderdate[o_idx], o_shippriority[o_idx]});
                 }
+                cur_ok = (int32_t)ok;
+                cur_rev = rev;
             }
         }
         if (cur_ok >= 0) {
@@ -131,9 +174,6 @@ inline void run_q3_impl(Database* db, std::ostream& out) {
                                o_orderdate[o_idx], o_shippriority[o_idx]});
         }
     }
-    TRACE_COUNT("q3_rows_scanned", li_scanned);
-    TRACE_COUNT("q3_join_rows_emitted", li_emitted);
-    TRACE_COUNT("q3_agg_rows_in", li_emitted);
     TRACE_COUNT("q3_groups_created", (uint64_t)results.size());
     TRACE_COUNT("q3_agg_rows_emitted", (uint64_t)results.size());
     TRACE_COUNT("q3_sort_rows_in", (uint64_t)results.size());
