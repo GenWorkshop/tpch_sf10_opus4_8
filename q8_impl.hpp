@@ -115,29 +115,69 @@ inline void run_q8_impl(Database* db, std::ostream& out) {
 
     {
         PROFILE_SCOPE("q8_lineitem_scan_join_agg");
+        // --- Phase 1: selective scan. Branchlessly left-pack the row indices that
+        // pass the (very selective) part filter into a candidate buffer. This keeps
+        // the 60M-row scan a tight, sequential, prefetch-friendly loop. ---
+        int32_t* __restrict cand = new int32_t[n];
+        int64_t cnt = 0;
         constexpr int64_t PD = 128;
-        for (int64_t i = 0; i < n; i++) {
+        const int64_t imax = (n > PD) ? (n - PD) : 0;
+        int64_t i = 0;
+        for (; i < imax; i++) {
             TRACE_INC(li_scanned);
-            if (i + PD < n) {
-                int32_t pkf = lp[i + PD];
-                __builtin_prefetch(&pm[(uint32_t)pkf >> 3], 0, 3);
-            }
+            __builtin_prefetch(&pm[(uint32_t)lp[i + PD] >> 3], 0, 3);
             int32_t pk = lp[i];
-            if (!((pm[pk >> 3] >> (pk & 7)) & 1)) continue;
-
-            int32_t ok = lo[i];
-            if ((uint32_t)ok > (uint32_t)max_ok) continue;
-            if (!((ov[ok >> 3] >> (ok & 7)) & 1)) continue;
-            uint32_t yr = (oyr[ok >> 3] >> (ok & 7)) & 1;
-
-            TRACE_INC(li_emitted);
-            double volume = (double)lep[i] * (double)(100 - ld[i]);
-            total_volume[yr] += volume;
-
-            int32_t sk = lsk[i];
-            uint32_t isfr = (sf[sk >> 3] >> (sk & 7)) & 1;
-            france_volume[yr] += isfr ? volume : 0.0;
+            uint32_t m = (pm[pk >> 3] >> (pk & 7)) & 1u;
+            cand[cnt] = (int32_t)i;
+            cnt += m;
         }
+        for (; i < n; i++) {
+            TRACE_INC(li_scanned);
+            int32_t pk = lp[i];
+            uint32_t m = (pm[pk >> 3] >> (pk & 7)) & 1u;
+            cand[cnt] = (int32_t)i;
+            cnt += m;
+        }
+
+        // --- Phase 2: gather l_orderkey for the candidates, prefetching far ahead so
+        // the random 240MB-array accesses overlap instead of stalling serially. ---
+        int32_t* __restrict cok = new int32_t[cnt ? cnt : 1];
+        constexpr int64_t GD = 64;
+        {
+            int64_t jmax = (cnt > GD) ? (cnt - GD) : 0;
+            int64_t j = 0;
+            for (; j < jmax; j++) {
+                __builtin_prefetch(&lo[cand[j + GD]], 0, 0);
+                cok[j] = lo[cand[j]];
+            }
+            for (; j < cnt; j++) cok[j] = lo[cand[j]];
+        }
+
+        // --- Phase 3: order-bitmap join + supplier + aggregate, prefetching the
+        // order-valid bitmap ahead of the dependent probe. ---
+        {
+            int64_t jmax = (cnt > GD) ? (cnt - GD) : 0;
+            int64_t j = 0;
+            for (; j < cnt; j++) {
+                if (j < jmax) {
+                    uint32_t okf = (uint32_t)cok[j + GD];
+                    if (okf <= (uint32_t)max_ok) __builtin_prefetch(&ov[okf >> 3], 0, 0);
+                }
+                int32_t ok = cok[j];
+                if ((uint32_t)ok > (uint32_t)max_ok) continue;
+                if (!((ov[ok >> 3] >> (ok & 7)) & 1)) continue;
+                uint32_t yr = (oyr[ok >> 3] >> (ok & 7)) & 1;
+                int32_t idx = cand[j];
+                TRACE_INC(li_emitted);
+                double volume = (double)lep[idx] * (double)(100 - ld[idx]);
+                total_volume[yr] += volume;
+                int32_t sk = lsk[idx];
+                uint32_t isfr = (sf[sk >> 3] >> (sk & 7)) & 1;
+                france_volume[yr] += isfr ? volume : 0.0;
+            }
+        }
+        delete[] cok;
+        delete[] cand;
     }
 
     TRACE_COUNT("q8_rows_scanned", li_scanned);
