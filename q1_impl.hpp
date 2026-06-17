@@ -21,7 +21,11 @@ inline void run_q1_impl(Database* db, std::ostream& out) {
     // l_shipdate <= '1998-12-01' - 100 days = '1998-08-23'
     const Date cutoff = date_to_epoch(1998, 8, 23);
 
-    // Group by (returnflag, linestatus) - only a few combinations
+    // Group by (returnflag, linestatus). DuckDB uses a PERFECT_HASH_GROUP_BY
+    // here: both grouping columns are single uppercase chars, so a direct
+    // flat array indexed by (rf-'A')*26 + (ls-'A') is a perfect hash and
+    // avoids the per-row tree lookup of std::map. Iterating the array in
+    // index order yields the required ORDER BY rf, ls.
     struct Agg {
         __int128 sum_qty = 0;        // scale 2
         __int128 sum_base_price = 0; // scale 2
@@ -33,24 +37,34 @@ inline void run_q1_impl(Database* db, std::ostream& out) {
         int64_t count = 0;
     };
 
-    // Key: (returnflag, linestatus)
-    std::map<std::pair<char,char>, Agg> groups;
+    constexpr int N_SLOTS = 26 * 26;
+    static thread_local Agg slots[N_SLOTS];
+    for (int s = 0; s < N_SLOTS; s++) slots[s] = Agg{};
+
+    const Date*    __restrict ship  = db->l_shipdate.data();
+    const char*    __restrict rf    = db->l_returnflag.data();
+    const char*    __restrict ls    = db->l_linestatus.data();
+    const int64_t* __restrict qtyA  = db->l_quantity.data();
+    const int64_t* __restrict prA   = db->l_extendedprice.data();
+    const int64_t* __restrict dscA  = db->l_discount.data();
+    const int64_t* __restrict taxA  = db->l_tax.data();
 
     TRACE_DECL_COUNTER(rows_scanned);
     TRACE_DECL_COUNTER(rows_emitted);
     {
         PROFILE_SCOPE("q1_scan_agg");
-        for (int64_t i = 0; i < db->n_lineitem; i++) {
+        const int64_t n = db->n_lineitem;
+        for (int64_t i = 0; i < n; i++) {
             TRACE_INC(rows_scanned);
-            if (db->l_shipdate[i] <= cutoff) {
+            if (ship[i] <= cutoff) {
                 TRACE_INC(rows_emitted);
-                auto key = std::make_pair(db->l_returnflag[i], db->l_linestatus[i]);
-                auto& g = groups[key];
+                int idx = (rf[i] - 'A') * 26 + (ls[i] - 'A');
+                Agg& g = slots[idx];
 
-                int64_t qty = db->l_quantity[i];       // scale 2
-                int64_t price = db->l_extendedprice[i]; // scale 2
-                int64_t disc = db->l_discount[i];       // scale 2 (e.g., 0.05 = 5)
-                int64_t tax = db->l_tax[i];             // scale 2
+                int64_t qty = qtyA[i];     // scale 2
+                int64_t price = prA[i];    // scale 2
+                int64_t disc = dscA[i];    // scale 2 (e.g., 0.05 = 5)
+                int64_t tax = taxA[i];     // scale 2
 
                 g.sum_qty += qty;
                 g.sum_base_price += price;
@@ -72,14 +86,17 @@ inline void run_q1_impl(Database* db, std::ostream& out) {
     TRACE_COUNT("q1_rows_scanned", rows_scanned);
     TRACE_COUNT("q1_rows_emitted", rows_emitted);
     TRACE_COUNT("q1_agg_rows_in", rows_emitted);
-    TRACE_COUNT("q1_groups_created", (uint64_t)groups.size());
-    TRACE_COUNT("q1_agg_rows_emitted", (uint64_t)groups.size());
 
     PROFILE_SCOPE("q1_output");
     write_csv_header(out, {"l_returnflag","l_linestatus","sum_qty","sum_base_price",
                            "sum_disc_price","sum_charge","avg_qty","avg_price","avg_disc","count_order"});
 
-    for (auto& [key, g] : groups) {
+    uint64_t n_groups = 0;
+    for (int idx = 0; idx < N_SLOTS; idx++) {
+        const Agg& g = slots[idx];
+        if (g.count == 0) continue;
+        n_groups++;
+        std::pair<char,char> key{ char('A' + idx / 26), char('A' + idx % 26) };
         // sum_qty: scale 2
         std::string s_sum_qty = fmt_money(static_cast<long long>(g.sum_qty), 2);
         // sum_base_price: scale 2
@@ -95,12 +112,12 @@ inline void run_q1_impl(Database* db, std::ostream& out) {
         // avg_disc: disc is scale 2
         double avg_disc = (g.sum_disc_d / g.count) / 100.0;
 
-        std::string rf(1, key.first);
-        std::string ls(1, key.second);
+        std::string rf_s(1, key.first);
+        std::string ls_s(1, key.second);
 
         write_csv_row(out, {
-            rf,
-            ls,
+            rf_s,
+            ls_s,
             s_sum_qty,
             s_sum_base_price,
             s_sum_disc_price,
@@ -111,5 +128,7 @@ inline void run_q1_impl(Database* db, std::ostream& out) {
             std::to_string(g.count)
         });
     }
-    TRACE_COUNT("q1_query_output_rows", (uint64_t)groups.size());
+    TRACE_COUNT("q1_groups_created", n_groups);
+    TRACE_COUNT("q1_agg_rows_emitted", n_groups);
+    TRACE_COUNT("q1_query_output_rows", n_groups);
 }
