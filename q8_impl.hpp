@@ -18,11 +18,14 @@ inline void run_q8_impl(Database* db, std::ostream& out) {
     // Bit-packed so the random probe (driven by the 60M lineitem scan) stays in L2.
     const int32_t np = db->n_part;
     std::vector<uint8_t> part_match((np >> 3) + 1, 0);
+    {
+    PROFILE_SCOPE("q8_part_filter");
     for (int32_t i = 0; i < np; i++) {
         if (db->p_type[i] == "ECONOMY BRUSHED TIN") {
             int32_t pk = i + 1; // 1-based
             part_match[pk >> 3] |= (uint8_t)(1u << (pk & 7));
         }
+    }
     }
 
     // region/nation filter: r_name = 'AMERICA' → set of customer nationkeys.
@@ -33,6 +36,17 @@ inline void run_q8_impl(Database* db, std::ostream& out) {
     uint8_t nation_in_america[256] = {0};
     for (int i = 0; i < db->n_nations; i++) {
         if (db->n_regionkey[i] == america_regionkey) nation_in_america[i & 0xff] = 1;
+    }
+    // customer ⋈ nation(AMERICA) folded into a bit-packed bitmap by custkey so the
+    // orders probe hits an L2-resident structure instead of the 6MB c_nationkey array.
+    const int32_t nc = db->n_customer;
+    std::vector<uint8_t> cust_america((nc >> 3) + 1, 0);
+    {
+    PROFILE_SCOPE("q8_cust_filter");
+    const int32_t* __restrict cnk = db->c_nationkey.data();
+    for (int32_t i = 0; i < nc; i++) {
+        if (nation_in_america[cnk[i] & 0xff]) cust_america[i >> 3] |= (uint8_t)(1u << (i & 7));
+    }
     }
 
     // supplier nation = FRANCE → bit-packed bitmap by suppkey.
@@ -51,18 +65,35 @@ inline void run_q8_impl(Database* db, std::ostream& out) {
     // only a single random lookup instead of orderkey→idx→year.
     const Date date_lo = date_to_epoch(1995, 1, 1);
     const Date date_hi = date_to_epoch(1996, 12, 31);
-    std::vector<int8_t> oyear_by_key(db->max_orderkey + 1, -1);
+    const Date date_1996 = date_to_epoch(1996, 1, 1);
+    // Encode the per-orderkey state in two bit-packed maps (15MB total) instead of a
+    // 60MB int8 array — slashing the zero-init cost and shrinking the lineitem probe.
+    const int32_t max_ok = db->max_orderkey;
+    const size_t obm_bytes = (size_t)(max_ok >> 3) + 1;
+    std::vector<uint8_t> ord_valid(obm_bytes, 0);
+    std::vector<uint8_t> ord_year(obm_bytes, 0);
+    {
+    PROFILE_SCOPE("q8_orders_join");
+    const Date* __restrict ood = db->o_orderdate.data();
+    const int32_t* __restrict ock = db->o_custkey.data();
+    const int32_t* __restrict ook = db->o_orderkey.data();
+    const uint8_t* __restrict ca = cust_america.data();
+    uint8_t* __restrict ov = ord_valid.data();
+    uint8_t* __restrict oyr = ord_year.data();
     for (int32_t i = 0; i < db->n_orders; i++) {
-        Date od = db->o_orderdate[i];
+        Date od = ood[i];
         if (od >= date_lo && od <= date_hi) {
-            int32_t c_idx = db->o_custkey[i] - 1;
-            if ((uint32_t)c_idx < (uint32_t)db->n_customer &&
-                nation_in_america[db->c_nationkey[c_idx] & 0xff]) {
-                // only years 1995 / 1996 fall in range → encode as 0 / 1
-                oyear_by_key[db->o_orderkey[i]] =
-                    (int8_t)(epoch_to_year(od) - 1995);
+            uint32_t c_idx = (uint32_t)(ock[i] - 1);
+            if (c_idx < (uint32_t)nc &&
+                ((ca[c_idx >> 3] >> (c_idx & 7)) & 1)) {
+                int32_t ok = ook[i];
+                ov[ok >> 3] |= (uint8_t)(1u << (ok & 7));
+                // only years 1995 / 1996 fall in range → year bit = 0 / 1
+                if (od >= date_1996)
+                    oyr[ok >> 3] |= (uint8_t)(1u << (ok & 7));
             }
         }
+    }
     }
 
     // ---- lineitem scan: part filter → order join → supplier(FRANCE) → group by year ----
@@ -75,21 +106,26 @@ inline void run_q8_impl(Database* db, std::ostream& out) {
     const int64_t* __restrict lep = db->l_extendedprice.data();
     const int64_t* __restrict ld = db->l_discount.data();
     const uint8_t* __restrict pm = part_match.data();
-    const int8_t* __restrict oy = oyear_by_key.data();
+    const uint8_t* __restrict ov = ord_valid.data();
+    const uint8_t* __restrict oyr = ord_year.data();
     const uint8_t* __restrict sf = supp_france.data();
-    const int32_t max_ok = db->max_orderkey;
 
     {
         PROFILE_SCOPE("q8_lineitem_scan_join_agg");
+        constexpr int64_t PD = 64;
         for (int64_t i = 0; i < n; i++) {
             TRACE_INC(li_scanned);
+            if (i + PD < n) {
+                int32_t pkf = lp[i + PD];
+                __builtin_prefetch(&pm[(uint32_t)pkf >> 3], 0, 0);
+            }
             int32_t pk = lp[i];
             if (!((pm[pk >> 3] >> (pk & 7)) & 1)) continue;
 
             int32_t ok = lo[i];
             if ((uint32_t)ok > (uint32_t)max_ok) continue;
-            int8_t yr = oy[ok];
-            if (yr < 0) continue;
+            if (!((ov[ok >> 3] >> (ok & 7)) & 1)) continue;
+            uint32_t yr = (oyr[ok >> 3] >> (ok & 7)) & 1;
 
             TRACE_INC(li_emitted);
             double volume = (double)lep[i] * (double)(100 - ld[i]);
