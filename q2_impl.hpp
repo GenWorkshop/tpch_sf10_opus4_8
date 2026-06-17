@@ -22,17 +22,11 @@ static void run_q2(Database* db, const std::string& run_nr) {
         }
     }
 
-    // Find nation keys in ASIA
-    std::unordered_set<int32_t> asia_nations;
-    for (int32_t nk : db->region_to_nation_keys[asia_regionkey]) {
-        asia_nations.insert(nk);
-    }
-
-    // Find suppliers in ASIA (suppkey -> true)
-    std::unordered_set<int32_t> asia_suppliers;
+    // ASIA supplier bitmap indexed by suppkey (array lookup, no hashing)
+    std::vector<char> is_asia(db->supplier_count + 1, 0);
     for (int32_t nk : db->region_to_nation_keys[asia_regionkey]) {
         for (int32_t sk : db->nation_to_suppliers[nk]) {
-            asia_suppliers.insert(sk);
+            is_asia[sk] = 1;
         }
     }
 
@@ -53,49 +47,57 @@ static void run_q2(Database* db, const std::string& run_nr) {
 
     std::vector<Result> results;
 
-    // Build partsupp index: partkey -> list of (suppkey, supplycost) for ASIA suppliers
-    // partsupp is stored flat, so we need to scan it
-    // Build a map: partkey -> vector of {suppkey, supplycost}
+    // Step 1: filter parts (p_size=8, p_type LIKE '%TIN') into a bitmap.
+    // This is the most selective predicate, so we use it to prune partsupp.
+    std::vector<char> is_match(db->part_count + 1, 0);
+    TRACE_DECL(parts_scanned);
+    TRACE_DECL(parts_matched);
+    {
+        PROFILE_SCOPE("q2_part_filter");
+        for (int32_t pk = 1; pk <= db->part_count; pk++) {
+            TRACE_INC(parts_scanned);
+            if (db->p_size[pk] != 8) continue;
+            const std::string& ptype = db->p_type[pk];
+            if (ptype.size() < 3 || ptype.compare(ptype.size() - 3, 3, "TIN") != 0) continue;
+            is_match[pk] = 1;
+            TRACE_INC(parts_matched);
+        }
+    }
+    TRACE_COUNT("q2_parts_scanned", parts_scanned);
+    TRACE_COUNT("q2_parts_matched", parts_matched);
+
+    // Step 2: scan partsupp once. The matching-part bitmap check is extremely
+    // selective (cheap array lookup), pruning the vast majority of rows before
+    // the ASIA supplier check. Surviving rows are grouped per matching part.
     struct PSEntry { int32_t suppkey; int64_t supplycost; };
     std::unordered_map<int32_t, std::vector<PSEntry>> ps_by_part;
     TRACE_DECL(ps_scanned);
     {
-        PROFILE_SCOPE("q2_partsupp_build");
+        PROFILE_SCOPE("q2_partsupp_probe");
         for (int64_t i = 0; i < db->partsupp_count; i++) {
             TRACE_INC(ps_scanned);
+            int32_t pk = db->ps_partkey[i];
+            if (!is_match[pk]) continue;
             int32_t sk = db->ps_suppkey[i];
-            if (asia_suppliers.count(sk)) {
-                ps_by_part[db->ps_partkey[i]].push_back({sk, db->ps_supplycost[i]});
-            }
+            if (!is_asia[sk]) continue;
+            ps_by_part[pk].push_back({sk, db->ps_supplycost[i]});
         }
     }
     TRACE_COUNT("q2_partsupp_scanned", ps_scanned);
     TRACE_COUNT("q2_build_rows", ps_by_part.size());
 
-    // Scan parts
-    TRACE_DECL(parts_scanned);
-    TRACE_DECL(parts_matched);
+    // Step 3: for each matching part, pick the min supplycost and emit all
+    // suppliers that achieve it.
     {
-        PROFILE_SCOPE("q2_part_scan_probe");
-        for (int32_t pk = 1; pk < (int32_t)db->p_size.size(); pk++) {
-            TRACE_INC(parts_scanned);
-            if (db->p_size[pk] != 8) continue;
-            const std::string& ptype = db->p_type[pk];
-            // Check LIKE '%TIN' - ends with "TIN"
-            if (ptype.size() < 3 || ptype.substr(ptype.size() - 3) != "TIN") continue;
-
-            auto it = ps_by_part.find(pk);
-            if (it == ps_by_part.end()) continue;
-            TRACE_INC(parts_matched);
-
-            // Find min supplycost for this part among ASIA suppliers
+        PROFILE_SCOPE("q2_minagg_emit");
+        for (auto& kv : ps_by_part) {
+            int32_t pk = kv.first;
+            auto& entries = kv.second;
             int64_t min_cost = LLONG_MAX;
-            for (auto& e : it->second) {
+            for (auto& e : entries) {
                 if (e.supplycost < min_cost) min_cost = e.supplycost;
             }
-
-            // Collect all suppliers with min cost
-            for (auto& e : it->second) {
+            for (auto& e : entries) {
                 if (e.supplycost == min_cost) {
                     int32_t sk = e.suppkey;
                     int32_t nk = db->s_nationkey[sk];
@@ -113,8 +115,6 @@ static void run_q2(Database* db, const std::string& run_nr) {
             }
         }
     }
-    TRACE_COUNT("q2_parts_scanned", parts_scanned);
-    TRACE_COUNT("q2_parts_matched", parts_matched);
     TRACE_COUNT("q2_join_rows_emitted", results.size());
 
     {
