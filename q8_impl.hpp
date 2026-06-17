@@ -20,8 +20,12 @@ inline void run_q8_impl(Database* db, std::ostream& out) {
     std::vector<uint8_t> part_match((np >> 3) + 1, 0);
     {
     PROFILE_SCOPE("q8_part_filter");
+    // Compare against a std::string (length-checked first) instead of a const char*
+    // literal, which would force a heap pointer-chase on every one of 2M parts.
+    static const std::string kType("ECONOMY BRUSHED TIN");
+    const std::string* __restrict pt = db->p_type.data();
     for (int32_t i = 0; i < np; i++) {
-        if (db->p_type[i] == "ECONOMY BRUSHED TIN") {
+        if (pt[i].size() == 19 && pt[i] == kType) {
             int32_t pk = i + 1; // 1-based
             part_match[pk >> 3] |= (uint8_t)(1u << (pk & 7));
         }
@@ -80,25 +84,18 @@ inline void run_q8_impl(Database* db, std::ostream& out) {
     const uint8_t* __restrict ca = cust_america.data();
     uint8_t* __restrict ov = ord_valid.data();
     uint8_t* __restrict oyr = ord_year.data();
-    constexpr int32_t OPD = 96;
     const int32_t no = db->n_orders;
+    const uint32_t ncu = (uint32_t)nc;
     for (int32_t i = 0; i < no; i++) {
-        if (i + OPD < no) {
-            uint32_t cf = (uint32_t)(ock[i + OPD] - 1);
-            __builtin_prefetch(&ca[cf >> 3], 0, 0);
-        }
         Date od = ood[i];
-        if (od >= date_lo && od <= date_hi) {
-            uint32_t c_idx = (uint32_t)(ock[i] - 1);
-            if (c_idx < (uint32_t)nc &&
-                ((ca[c_idx >> 3] >> (c_idx & 7)) & 1)) {
-                int32_t ok = ook[i];
-                ov[ok >> 3] |= (uint8_t)(1u << (ok & 7));
-                // only years 1995 / 1996 fall in range → year bit = 0 / 1
-                if (od >= date_1996)
-                    oyr[ok >> 3] |= (uint8_t)(1u << (ok & 7));
-            }
-        }
+        uint32_t in_date = (uint32_t)((od >= date_lo) & (od <= date_hi));
+        uint32_t c_idx = (uint32_t)(ock[i] - 1);
+        uint32_t in_am = (c_idx < ncu) ? ((ca[c_idx >> 3] >> (c_idx & 7)) & 1u) : 0u;
+        uint32_t valid = in_date & in_am;
+        uint32_t is96 = valid & (uint32_t)(od >= date_1996);
+        int32_t ok = ook[i];
+        ov[ok >> 3] |= (uint8_t)(valid << (ok & 7));
+        oyr[ok >> 3] |= (uint8_t)(is96 << (ok & 7));
     }
     }
 
