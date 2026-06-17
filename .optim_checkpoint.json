@@ -4,6 +4,7 @@
   "current_query": "q1",
   "completed_stages": [
     "sample_plan",
-    "trace"
+    "trace",
+    "expert_knowledge"
   ]
 }
