@@ -1,0 +1,28 @@
+# Build artefacts
+build/
+build_opt/
+build_trace/
+*.o
+*.d
+
+# Compiled binary
+db
+db_trace
+
+# Generated outputs (query results, explanations)
+*.csv
+explanation.md
+
+# Session & progress state (managed separately)
+.sessions/
+.progress.json
+.status
+.tool_failures.json
+
+# Logs
+*.log
+
+# Editor / OS junk
+.DS_Store
+*.swp
+*~
