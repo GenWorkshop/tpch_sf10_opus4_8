@@ -23,19 +23,51 @@ inline void run_q4_impl(Database* db, std::ostream& out) {
     const std::string* repr[10] = {nullptr};
 
     if (db->lineitem_sorted_by_orderkey) {
-        // Single fused pass: orders date filter + CSR semi-join probe + aggregate.
-        PROFILE_SCOPE("q4_orders_scan_agg");
         const Date* __restrict odate = db->o_orderdate.data();
         const int32_t* __restrict okey = db->o_orderkey.data();
         const int64_t* __restrict ls = db->orderkey_lineitem_start.data();
         const int64_t* __restrict le = db->orderkey_lineitem_end.data();
         const Date* __restrict lc = db->l_commitdate.data();
         const Date* __restrict lr = db->l_receiptdate.data();
-        for (int32_t i = 0; i < db->n_orders; i++) {
-            TRACE_INC(orders_scanned);
-            Date d = odate[i];
-            if (d >= date_lo && d < date_hi) {
-                int32_t ok = okey[i];
+
+        // Phase 1: tight sequential scan of the date column, collecting the
+        // (sparse, ~3.8%) order rows that pass the date filter. This part is
+        // streaming and branch-predictable; it separates the cheap sequential
+        // work from the expensive data-dependent gathers below.
+        std::vector<int32_t> pass;
+        {
+            PROFILE_SCOPE("q4_orders_date_filter");
+            pass.reserve((size_t)db->n_orders / 16 + 64);
+            for (int32_t i = 0; i < db->n_orders; i++) {
+                TRACE_INC(orders_scanned);
+                Date d = odate[i];
+                if (d >= date_lo && d < date_hi) pass.push_back(i);
+            }
+        }
+
+        // Phase 2: probe lineitem CSR for each passing order with a software
+        // prefetch pipeline. The CSR boundary arrays (ls/le) and lineitem date
+        // columns are large and accessed at data-dependent offsets, so we issue
+        // prefetches well ahead of use to hide DRAM latency.
+        {
+            PROFILE_SCOPE("q4_orders_scan_agg");
+            const int n = (int)pass.size();
+            const int PF1 = 32;  // prefetch CSR boundaries this far ahead
+            const int PF2 = 12;  // prefetch lineitem dates this far ahead
+            for (int k = 0; k < n; k++) {
+                if (k + PF1 < n) {
+                    int32_t fok = okey[pass[k + PF1]];
+                    __builtin_prefetch(&ls[fok], 0, 1);
+                    __builtin_prefetch(&le[fok], 0, 1);
+                }
+                if (k + PF2 < n) {
+                    int32_t mok = okey[pass[k + PF2]];
+                    int64_t ms = ls[mok];
+                    __builtin_prefetch(&lc[ms], 0, 1);
+                    __builtin_prefetch(&lr[ms], 0, 1);
+                }
+                int32_t row = pass[k];
+                int32_t ok = okey[row];
                 int64_t start = ls[ok];
                 int64_t end = le[ok];
                 bool late = false;
@@ -45,7 +77,7 @@ inline void run_q4_impl(Database* db, std::ostream& out) {
                 }
                 if (late) {
                     TRACE_INC(orders_emitted);
-                    const std::string& p = db->o_orderpriority[i];
+                    const std::string& p = db->o_orderpriority[row];
                     int b = (int)((unsigned char)p[0] - '1');
                     cnt[b]++;
                     if (!repr[b]) repr[b] = &p;
