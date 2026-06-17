@@ -7,6 +7,7 @@
 #include <map>
 #include <vector>
 #include <cmath>
+#include <immintrin.h>
 
 // q1: lineitem scan with date filter, group by returnflag+linestatus, aggregate
 // l_shipdate <= date '1998-12-01' - interval '100' day = 1998-08-23
@@ -22,7 +23,7 @@ static inline int32_t date_to_days(int y, int m, int d) {
     return era * 146097 + static_cast<int>(doe) - 719468;
 }
 
-static void run_q1(Database* db, const std::string& run_nr) {
+static void __attribute__((target("avx2"))) run_q1(Database* db, const std::string& run_nr) {
     // 1998-12-01 minus 100 days = 1998-08-23
     const int32_t max_shipdate = date_to_days(1998, 8, 23);
 
@@ -61,36 +62,62 @@ static void run_q1(Database* db, const std::string& run_nr) {
     {
         PROFILE_SCOPE("q1_scan_agg");
         const int64_t n = db->lineitem_count;
+
+        // AVX2 vectorised scan: process 4 rows per iteration.  256-bit loads
+        // raise memory-level parallelism and the arithmetic (subtract, the two
+        // multiplies, masking) runs 4-wide.  l_extendedprice < 2^31 and the
+        // intermediate disc_price < 2^31, so the products fit the signed
+        // 32x32 -> 64 multiply (_mm256_mul_epi32).  The grouped scatter stays
+        // scalar but is fed from masked vectors, with adjacent rows routed to
+        // two independent tables to break the read-modify-write chain.
+        const __m256i v100 = _mm256_set1_epi64x(100);
+        const __m128i vmax = _mm_set1_epi32(max_shipdate);
+        const __m128i vones = _mm_set1_epi32(-1);
+
+        alignas(32) int64_t mqty[4], mbase[4], mdisc_price[4], mcharge[4], mdisc[4], mmask[4];
+
         int64_t i = 0;
-        // Two independent accumulator tables break the read-modify-write
-        // dependency chain when consecutive rows fall into the same group.
-        for (; i + 1 < n; i += 2) {
-            if (shipdate[i] <= max_shipdate) {
-                int key = (((unsigned char)returnflag[i]) << 7) | (unsigned char)linestatus[i];
-                Agg& agg = table0[key];
-                int64_t price = extprice[i];
-                int64_t disc = discount[i];
-                int64_t disc_price = price * (100 - disc);
-                agg.sum_qty += quantity[i];
-                agg.sum_base_price += price;
-                agg.sum_disc_price += disc_price;
-                agg.sum_charge += disc_price * (100 + tax[i]);
-                agg.sum_discount += disc;
-                agg.count++;
-            }
-            if (shipdate[i + 1] <= max_shipdate) {
-                int key = (((unsigned char)returnflag[i + 1]) << 7) | (unsigned char)linestatus[i + 1];
-                Agg& agg = table1[key];
-                int64_t price = extprice[i + 1];
-                int64_t disc = discount[i + 1];
-                int64_t disc_price = price * (100 - disc);
-                agg.sum_qty += quantity[i + 1];
-                agg.sum_base_price += price;
-                agg.sum_disc_price += disc_price;
-                agg.sum_charge += disc_price * (100 + tax[i + 1]);
-                agg.sum_discount += disc;
-                agg.count++;
-            }
+        for (; i + 4 <= n; i += 4) {
+            __m128i ship = _mm_loadu_si128((const __m128i*)(shipdate + i));
+            // pass = shipdate <= max  ==  !(shipdate > max)
+            __m128i gt = _mm_cmpgt_epi32(ship, vmax);
+            __m128i pass32 = _mm_xor_si128(gt, vones);
+            __m256i mask = _mm256_cvtepi32_epi64(pass32);   // 4x 64-bit 0/-1
+
+            __m256i qty   = _mm256_loadu_si256((const __m256i*)(quantity + i));
+            __m256i price = _mm256_loadu_si256((const __m256i*)(extprice + i));
+            __m256i disc  = _mm256_loadu_si256((const __m256i*)(discount + i));
+            __m256i tax_  = _mm256_loadu_si256((const __m256i*)(tax + i));
+
+            __m256i one_minus_disc = _mm256_sub_epi64(v100, disc);     // 100 - disc
+            __m256i one_plus_tax   = _mm256_add_epi64(v100, tax_);     // 100 + tax
+            __m256i disc_price = _mm256_mul_epi32(price, one_minus_disc);
+            __m256i charge     = _mm256_mul_epi32(disc_price, one_plus_tax);
+
+            _mm256_store_si256((__m256i*)mqty,        _mm256_and_si256(qty, mask));
+            _mm256_store_si256((__m256i*)mbase,       _mm256_and_si256(price, mask));
+            _mm256_store_si256((__m256i*)mdisc_price, _mm256_and_si256(disc_price, mask));
+            _mm256_store_si256((__m256i*)mcharge,     _mm256_and_si256(charge, mask));
+            _mm256_store_si256((__m256i*)mdisc,       _mm256_and_si256(disc, mask));
+            _mm256_store_si256((__m256i*)mmask,       mask);
+
+            #define Q1_SCATTER(J, TBL)                                                       \
+                {                                                                            \
+                    int key = (((unsigned char)returnflag[i + (J)]) << 7)                    \
+                              | (unsigned char)linestatus[i + (J)];                          \
+                    Agg& agg = TBL[key];                                                     \
+                    agg.sum_qty += mqty[J];                                                  \
+                    agg.sum_base_price += mbase[J];                                          \
+                    agg.sum_disc_price += mdisc_price[J];                                    \
+                    agg.sum_charge += mcharge[J];                                            \
+                    agg.sum_discount += mdisc[J];                                            \
+                    agg.count += (mmask[J] & 1);                                             \
+                }
+            Q1_SCATTER(0, table0)
+            Q1_SCATTER(1, table1)
+            Q1_SCATTER(2, table0)
+            Q1_SCATTER(3, table1)
+            #undef Q1_SCATTER
         }
         for (; i < n; i++) {
             if (shipdate[i] <= max_shipdate) {
