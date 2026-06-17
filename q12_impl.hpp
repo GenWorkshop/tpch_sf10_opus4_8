@@ -53,7 +53,9 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
         // fixed distance ahead to hide the cache-miss latency.
         constexpr int64_t PF = 48;
         constexpr int64_t PF2 = 16;
+        constexpr int64_t PF3 = 6;
         const int32_t* __restrict ok2idx = db->orderkey_to_idx.data();
+        const std::string* __restrict oprio = db->o_orderpriority.data();
         const int32_t max_ok = db->max_orderkey;
         for (int64_t s = 0; s < count; s++) {
             if (s + PF < count) {
@@ -69,6 +71,15 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
                 const int32_t j = survivors[s + PF2];
                 const int32_t ok = orderkey[j];
                 if (ok >= 0 && ok <= max_ok) __builtin_prefetch(&ok2idx[ok], 0, 1);
+            }
+            if (s + PF3 < count) {
+                // ok2idx[] entry is now warm; chase into o_orderpriority.
+                const int32_t j = survivors[s + PF3];
+                const int32_t ok = orderkey[j];
+                if (ok >= 0 && ok <= max_ok) {
+                    const int32_t oi = ok2idx[ok];
+                    if (oi >= 0) __builtin_prefetch(&oprio[oi], 0, 1);
+                }
             }
             const int32_t i = survivors[s];
             const Date rd = receiptdate[i];
@@ -94,7 +105,7 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
             if (o_idx < 0) continue;
 
             TRACE_INC(li_emitted);
-            const std::string& prio = db->o_orderpriority[o_idx];
+            const std::string& prio = oprio[o_idx];
             if (prio == "1-URGENT" || prio == "2-HIGH") {
                 g->high_count++;
             } else {
