@@ -11,6 +11,9 @@
 #include <algorithm>
 
 inline void run_q9_impl(Database* db, std::ostream& out) {
+    PROFILE_SCOPE("q9_total");
+    TRACE_DECL_COUNTER(li_scanned);
+    TRACE_DECL_COUNTER(li_emitted);
     // Filter: p_name like '%rosy%'
     std::unordered_set<int32_t> matching_partkeys; // 1-based
     for (int32_t i = 0; i < db->n_part; i++) {
@@ -41,36 +44,46 @@ inline void run_q9_impl(Database* db, std::ostream& out) {
     };
     std::map<Key, __int128> groups;
 
-    for (int64_t i = 0; i < db->n_lineitem; i++) {
-        int32_t partkey = db->l_partkey[i];
-        if (!matching_partkeys.count(partkey)) continue;
+    {
+        PROFILE_SCOPE("q9_lineitem_scan_join_agg");
+        for (int64_t i = 0; i < db->n_lineitem; i++) {
+            TRACE_INC(li_scanned);
+            int32_t partkey = db->l_partkey[i];
+            if (!matching_partkeys.count(partkey)) continue;
 
-        int32_t suppkey = db->l_suppkey[i];
-        int32_t s_idx = suppkey - 1;
-        if (s_idx < 0 || s_idx >= db->n_supplier) continue;
+            int32_t suppkey = db->l_suppkey[i];
+            int32_t s_idx = suppkey - 1;
+            if (s_idx < 0 || s_idx >= db->n_supplier) continue;
 
-        // Get supplycost from partsupp
-        int64_t ps_key = (int64_t)partkey * 1000000LL + suppkey;
-        auto it = ps_cost.find(ps_key);
-        if (it == ps_cost.end()) continue;
-        int64_t supplycost = it->second;
+            // Get supplycost from partsupp
+            int64_t ps_key = (int64_t)partkey * 1000000LL + suppkey;
+            auto it = ps_cost.find(ps_key);
+            if (it == ps_cost.end()) continue;
+            int64_t supplycost = it->second;
 
-        // Get order year
-        int32_t orderkey = db->l_orderkey[i];
-        if (orderkey > db->max_orderkey) continue;
-        int32_t o_idx = db->orderkey_to_idx[orderkey];
-        if (o_idx < 0) continue;
-        int32_t year = epoch_to_year(db->o_orderdate[o_idx]);
+            // Get order year
+            int32_t orderkey = db->l_orderkey[i];
+            if (orderkey > db->max_orderkey) continue;
+            int32_t o_idx = db->orderkey_to_idx[orderkey];
+            if (o_idx < 0) continue;
+            int32_t year = epoch_to_year(db->o_orderdate[o_idx]);
 
-        // Get supplier nation
-        int32_t nation_key = db->s_nationkey[s_idx];
+            // Get supplier nation
+            int32_t nation_key = db->s_nationkey[s_idx];
 
-        // amount = extprice * (100 - disc) - supplycost * quantity (all scale 4)
-        __int128 amount = (__int128)db->l_extendedprice[i] * (100 - db->l_discount[i])
-                        - (__int128)supplycost * db->l_quantity[i];
+            TRACE_INC(li_emitted);
+            // amount = extprice * (100 - disc) - supplycost * quantity (all scale 4)
+            __int128 amount = (__int128)db->l_extendedprice[i] * (100 - db->l_discount[i])
+                            - (__int128)supplycost * db->l_quantity[i];
 
-        groups[{nation_key, year}] += amount;
+            groups[{nation_key, year}] += amount;
+        }
     }
+    TRACE_COUNT("q9_rows_scanned", li_scanned);
+    TRACE_COUNT("q9_join_rows_emitted", li_emitted);
+    TRACE_COUNT("q9_agg_rows_in", li_emitted);
+    TRACE_COUNT("q9_groups_created", (uint64_t)groups.size());
+    TRACE_COUNT("q9_agg_rows_emitted", (uint64_t)groups.size());
 
     // Sort: by nation name asc, then year desc (already handled by Key::operator<)
     // But we need to sort by nation *name* not key, so let's re-sort
@@ -83,12 +96,18 @@ inline void run_q9_impl(Database* db, std::ostream& out) {
     for (auto& [k, v] : groups) {
         results.push_back({db->n_name[k.nation_key], k.year, v});
     }
-    std::sort(results.begin(), results.end(), [](const ResultRow& a, const ResultRow& b) {
-        int cmp = a.nation.compare(b.nation);
-        if (cmp != 0) return cmp < 0;
-        return a.year > b.year;
-    });
+    TRACE_COUNT("q9_sort_rows_in", (uint64_t)results.size());
+    {
+        PROFILE_SCOPE("q9_sort");
+        std::sort(results.begin(), results.end(), [](const ResultRow& a, const ResultRow& b) {
+            int cmp = a.nation.compare(b.nation);
+            if (cmp != 0) return cmp < 0;
+            return a.year > b.year;
+        });
+    }
+    TRACE_COUNT("q9_sort_rows_out", (uint64_t)results.size());
 
+    PROFILE_SCOPE("q9_output");
     write_csv_header(out, {"nation","o_year","sum_profit"});
     for (auto& r : results) {
         write_csv_row(out, {
@@ -97,4 +116,5 @@ inline void run_q9_impl(Database* db, std::ostream& out) {
             fmt_money(static_cast<long long>(r.sum_profit), 4)
         });
     }
+    TRACE_COUNT("q9_query_output_rows", (uint64_t)results.size());
 }

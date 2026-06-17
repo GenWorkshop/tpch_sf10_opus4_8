@@ -11,6 +11,9 @@
 #include <tuple>
 
 inline void run_q16_impl(Database* db, std::ostream& out) {
+    PROFILE_SCOPE("q16_total");
+    TRACE_DECL_COUNTER(ps_scanned);
+    TRACE_DECL_COUNTER(ps_emitted);
     // Find suppliers whose comment matches '%Customer%Complaints%'
     std::unordered_set<int32_t> bad_suppliers; // suppkeys (1-based)
     for (int32_t i = 0; i < db->n_supplier; i++) {
@@ -44,16 +47,25 @@ inline void run_q16_impl(Database* db, std::ostream& out) {
     using GKey = std::tuple<std::string, std::string, int32_t>;
     std::map<GKey, std::set<int32_t>> groups; // → set of distinct suppkeys
 
-    for (int32_t i = 0; i < db->n_partsupp; i++) {
-        int32_t pk = db->ps_partkey[i];
-        if (!qual_partkeys.count(pk)) continue;
-        int32_t sk = db->ps_suppkey[i];
-        if (bad_suppliers.count(sk)) continue;
+    {
+        PROFILE_SCOPE("q16_partsupp_scan_join_agg");
+        for (int32_t i = 0; i < db->n_partsupp; i++) {
+            TRACE_INC(ps_scanned);
+            int32_t pk = db->ps_partkey[i];
+            if (!qual_partkeys.count(pk)) continue;
+            int32_t sk = db->ps_suppkey[i];
+            if (bad_suppliers.count(sk)) continue;
 
-        int32_t p_idx = pk - 1;
-        GKey key = {db->p_brand[p_idx], db->p_type[p_idx], db->p_size[p_idx]};
-        groups[key].insert(sk);
+            TRACE_INC(ps_emitted);
+            int32_t p_idx = pk - 1;
+            GKey key = {db->p_brand[p_idx], db->p_type[p_idx], db->p_size[p_idx]};
+            groups[key].insert(sk);
+        }
     }
+    TRACE_COUNT("q16_rows_scanned", ps_scanned);
+    TRACE_COUNT("q16_rows_emitted", ps_emitted);
+    TRACE_COUNT("q16_agg_rows_in", ps_emitted);
+    TRACE_COUNT("q16_groups_created", (uint64_t)groups.size());
 
     // Build results
     struct ResultRow {
@@ -67,17 +79,24 @@ inline void run_q16_impl(Database* db, std::ostream& out) {
     for (auto& [k, suppset] : groups) {
         results.push_back({std::get<0>(k), std::get<1>(k), std::get<2>(k), (int64_t)suppset.size()});
     }
+    TRACE_COUNT("q16_agg_rows_emitted", (uint64_t)results.size());
 
     // Order by supplier_cnt desc, p_brand, p_type, p_size
-    std::sort(results.begin(), results.end(), [](const ResultRow& a, const ResultRow& b) {
-        if (a.supplier_cnt != b.supplier_cnt) return a.supplier_cnt > b.supplier_cnt;
-        int cmp = a.p_brand.compare(b.p_brand);
-        if (cmp != 0) return cmp < 0;
-        cmp = a.p_type.compare(b.p_type);
-        if (cmp != 0) return cmp < 0;
-        return a.p_size < b.p_size;
-    });
+    TRACE_COUNT("q16_sort_rows_in", (uint64_t)results.size());
+    {
+        PROFILE_SCOPE("q16_sort");
+        std::sort(results.begin(), results.end(), [](const ResultRow& a, const ResultRow& b) {
+            if (a.supplier_cnt != b.supplier_cnt) return a.supplier_cnt > b.supplier_cnt;
+            int cmp = a.p_brand.compare(b.p_brand);
+            if (cmp != 0) return cmp < 0;
+            cmp = a.p_type.compare(b.p_type);
+            if (cmp != 0) return cmp < 0;
+            return a.p_size < b.p_size;
+        });
+    }
+    TRACE_COUNT("q16_sort_rows_out", (uint64_t)results.size());
 
+    PROFILE_SCOPE("q16_output");
     write_csv_header(out, {"p_brand","p_type","p_size","supplier_cnt"});
     for (auto& r : results) {
         write_csv_row(out, {
@@ -87,4 +106,5 @@ inline void run_q16_impl(Database* db, std::ostream& out) {
             std::to_string(r.supplier_cnt)
         });
     }
+    TRACE_COUNT("q16_query_output_rows", (uint64_t)results.size());
 }

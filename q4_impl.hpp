@@ -9,6 +9,10 @@
 #include <unordered_set>
 
 inline void run_q4_impl(Database* db, std::ostream& out) {
+    PROFILE_SCOPE("q4_total");
+    TRACE_DECL_COUNTER(orders_scanned);
+    TRACE_DECL_COUNTER(orders_emitted);
+    TRACE_DECL_COUNTER(li_probed);
     // o_orderdate >= '1993-09-01' AND o_orderdate < '1993-12-01'
     const Date date_lo = date_to_epoch(1993, 9, 1);
     const Date date_hi = date_to_epoch(1993, 12, 1);
@@ -16,28 +20,33 @@ inline void run_q4_impl(Database* db, std::ostream& out) {
     // Build set of orderkeys that have at least one lineitem with commitdate < receiptdate
     std::vector<bool> order_has_late(db->max_orderkey + 1, false);
 
-    if (db->lineitem_sorted_by_orderkey) {
-        // Use CSR index
-        for (int32_t i = 0; i < db->n_orders; i++) {
-            int32_t ok = db->o_orderkey[i];
-            if (db->o_orderdate[i] >= date_lo && db->o_orderdate[i] < date_hi) {
-                int64_t start = db->orderkey_lineitem_start[ok];
-                int64_t end = db->orderkey_lineitem_end[ok];
-                for (int64_t j = start; j < end; j++) {
-                    if (db->l_commitdate[j] < db->l_receiptdate[j]) {
-                        order_has_late[ok] = true;
-                        break;
+    {
+        PROFILE_SCOPE("q4_lineitem_semijoin");
+        if (db->lineitem_sorted_by_orderkey) {
+            // Use CSR index
+            for (int32_t i = 0; i < db->n_orders; i++) {
+                int32_t ok = db->o_orderkey[i];
+                if (db->o_orderdate[i] >= date_lo && db->o_orderdate[i] < date_hi) {
+                    int64_t start = db->orderkey_lineitem_start[ok];
+                    int64_t end = db->orderkey_lineitem_end[ok];
+                    for (int64_t j = start; j < end; j++) {
+                        TRACE_INC(li_probed);
+                        if (db->l_commitdate[j] < db->l_receiptdate[j]) {
+                            order_has_late[ok] = true;
+                            break;
+                        }
                     }
                 }
             }
-        }
-    } else {
-        // Scan all lineitem to find orders with late receipts
-        for (int64_t i = 0; i < db->n_lineitem; i++) {
-            if (db->l_commitdate[i] < db->l_receiptdate[i]) {
-                int32_t ok = db->l_orderkey[i];
-                if (ok <= db->max_orderkey) {
-                    order_has_late[ok] = true;
+        } else {
+            // Scan all lineitem to find orders with late receipts
+            for (int64_t i = 0; i < db->n_lineitem; i++) {
+                TRACE_INC(li_probed);
+                if (db->l_commitdate[i] < db->l_receiptdate[i]) {
+                    int32_t ok = db->l_orderkey[i];
+                    if (ok <= db->max_orderkey) {
+                        order_has_late[ok] = true;
+                    }
                 }
             }
         }
@@ -45,17 +54,29 @@ inline void run_q4_impl(Database* db, std::ostream& out) {
 
     // Count by orderpriority
     std::map<std::string, int64_t> counts;
-    for (int32_t i = 0; i < db->n_orders; i++) {
-        if (db->o_orderdate[i] >= date_lo && db->o_orderdate[i] < date_hi) {
-            int32_t ok = db->o_orderkey[i];
-            if (order_has_late[ok]) {
-                counts[db->o_orderpriority[i]]++;
+    {
+        PROFILE_SCOPE("q4_orders_scan_agg");
+        for (int32_t i = 0; i < db->n_orders; i++) {
+            TRACE_INC(orders_scanned);
+            if (db->o_orderdate[i] >= date_lo && db->o_orderdate[i] < date_hi) {
+                int32_t ok = db->o_orderkey[i];
+                if (order_has_late[ok]) {
+                    TRACE_INC(orders_emitted);
+                    counts[db->o_orderpriority[i]]++;
+                }
             }
         }
     }
+    TRACE_COUNT("q4_probe_rows_in", li_probed);
+    TRACE_COUNT("q4_rows_scanned", orders_scanned);
+    TRACE_COUNT("q4_rows_emitted", orders_emitted);
+    TRACE_COUNT("q4_groups_created", (uint64_t)counts.size());
+    TRACE_COUNT("q4_agg_rows_emitted", (uint64_t)counts.size());
 
+    PROFILE_SCOPE("q4_output");
     write_csv_header(out, {"o_orderpriority","order_count"});
     for (auto& [prio, cnt] : counts) {
         write_csv_row(out, {prio, std::to_string(cnt)});
     }
+    TRACE_COUNT("q4_query_output_rows", (uint64_t)counts.size());
 }

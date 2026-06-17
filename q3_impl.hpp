@@ -27,6 +27,9 @@ inline std::string format_date(int32_t days) {
 }
 
 inline void run_q3_impl(Database* db, std::ostream& out) {
+    PROFILE_SCOPE("q3_total");
+    TRACE_DECL_COUNTER(li_scanned);
+    TRACE_DECL_COUNTER(li_emitted);
     // Filters:
     // c_mktsegment = 'BUILDING'
     // o_orderdate < '1995-03-08'
@@ -63,23 +66,33 @@ inline void run_q3_impl(Database* db, std::ostream& out) {
     };
     std::unordered_map<int32_t, GroupVal> groups; // key = orderkey
 
-    for (int64_t i = 0; i < db->n_lineitem; i++) {
-        if (db->l_shipdate[i] > date_filter) {
-            int32_t orderkey = db->l_orderkey[i];
-            if (orderkey <= db->max_orderkey) {
-                int32_t o_idx = db->orderkey_to_idx[orderkey];
-                if (o_idx >= 0 && order_qualifies[o_idx]) {
-                    int64_t rev = db->l_extendedprice[i] * (100 - db->l_discount[i]);
-                    auto it = groups.find(orderkey);
-                    if (it == groups.end()) {
-                        groups[orderkey] = {rev, db->o_orderdate[o_idx], db->o_shippriority[o_idx]};
-                    } else {
-                        it->second.revenue += rev;
+    {
+        PROFILE_SCOPE("q3_lineitem_scan_join_agg");
+        for (int64_t i = 0; i < db->n_lineitem; i++) {
+            TRACE_INC(li_scanned);
+            if (db->l_shipdate[i] > date_filter) {
+                int32_t orderkey = db->l_orderkey[i];
+                if (orderkey <= db->max_orderkey) {
+                    int32_t o_idx = db->orderkey_to_idx[orderkey];
+                    if (o_idx >= 0 && order_qualifies[o_idx]) {
+                        TRACE_INC(li_emitted);
+                        int64_t rev = db->l_extendedprice[i] * (100 - db->l_discount[i]);
+                        auto it = groups.find(orderkey);
+                        if (it == groups.end()) {
+                            groups[orderkey] = {rev, db->o_orderdate[o_idx], db->o_shippriority[o_idx]};
+                        } else {
+                            it->second.revenue += rev;
+                        }
                     }
                 }
             }
         }
     }
+    TRACE_COUNT("q3_rows_scanned", li_scanned);
+    TRACE_COUNT("q3_join_rows_emitted", li_emitted);
+    TRACE_COUNT("q3_agg_rows_in", li_emitted);
+    TRACE_COUNT("q3_groups_created", (uint64_t)groups.size());
+    TRACE_COUNT("q3_agg_rows_emitted", (uint64_t)groups.size());
 
     // Step 4: Sort by revenue desc, o_orderdate asc
     struct ResultRow {
@@ -93,12 +106,18 @@ inline void run_q3_impl(Database* db, std::ostream& out) {
     for (auto& [ok, g] : groups) {
         results.push_back({ok, g.revenue, g.o_orderdate, g.o_shippriority});
     }
-    std::sort(results.begin(), results.end(), [](const ResultRow& a, const ResultRow& b) {
-        if (a.revenue != b.revenue) return a.revenue > b.revenue;
-        return a.o_orderdate < b.o_orderdate;
-    });
+    TRACE_COUNT("q3_sort_rows_in", (uint64_t)results.size());
+    {
+        PROFILE_SCOPE("q3_sort");
+        std::sort(results.begin(), results.end(), [](const ResultRow& a, const ResultRow& b) {
+            if (a.revenue != b.revenue) return a.revenue > b.revenue;
+            return a.o_orderdate < b.o_orderdate;
+        });
+    }
+    TRACE_COUNT("q3_sort_rows_out", (uint64_t)results.size());
 
     // Output
+    PROFILE_SCOPE("q3_output");
     write_csv_header(out, {"l_orderkey","revenue","o_orderdate","o_shippriority"});
     for (auto& r : results) {
         write_csv_row(out, {
@@ -108,4 +127,5 @@ inline void run_q3_impl(Database* db, std::ostream& out) {
             std::to_string(r.o_shippriority)
         });
     }
+    TRACE_COUNT("q3_query_output_rows", (uint64_t)results.size());
 }

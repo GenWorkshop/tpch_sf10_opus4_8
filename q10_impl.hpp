@@ -8,6 +8,9 @@
 #include <algorithm>
 
 inline void run_q10_impl(Database* db, std::ostream& out) {
+    PROFILE_SCOPE("q10_total");
+    TRACE_DECL_COUNTER(li_scanned);
+    TRACE_DECL_COUNTER(li_emitted);
     // o_orderdate >= '1993-08-01' AND o_orderdate < '1993-11-01'
     const Date date_lo = date_to_epoch(1993, 8, 1);
     const Date date_hi = date_to_epoch(1993, 11, 1);
@@ -24,18 +27,28 @@ inline void run_q10_impl(Database* db, std::ostream& out) {
     // Group by custkey → sum revenue
     std::unordered_map<int32_t, int64_t> cust_revenue; // custkey → revenue (scale 4)
 
-    for (int64_t i = 0; i < db->n_lineitem; i++) {
-        if (db->l_returnflag[i] != 'R') continue;
+    {
+        PROFILE_SCOPE("q10_lineitem_scan_join_agg");
+        for (int64_t i = 0; i < db->n_lineitem; i++) {
+            TRACE_INC(li_scanned);
+            if (db->l_returnflag[i] != 'R') continue;
 
-        int32_t orderkey = db->l_orderkey[i];
-        if (orderkey > db->max_orderkey) continue;
-        int32_t o_idx = db->orderkey_to_idx[orderkey];
-        if (o_idx < 0 || !order_qualifies[o_idx]) continue;
+            int32_t orderkey = db->l_orderkey[i];
+            if (orderkey > db->max_orderkey) continue;
+            int32_t o_idx = db->orderkey_to_idx[orderkey];
+            if (o_idx < 0 || !order_qualifies[o_idx]) continue;
 
-        int32_t custkey = db->o_custkey[o_idx];
-        int64_t rev = db->l_extendedprice[i] * (100 - db->l_discount[i]); // scale 4
-        cust_revenue[custkey] += rev;
+            TRACE_INC(li_emitted);
+            int32_t custkey = db->o_custkey[o_idx];
+            int64_t rev = db->l_extendedprice[i] * (100 - db->l_discount[i]); // scale 4
+            cust_revenue[custkey] += rev;
+        }
     }
+    TRACE_COUNT("q10_rows_scanned", li_scanned);
+    TRACE_COUNT("q10_join_rows_emitted", li_emitted);
+    TRACE_COUNT("q10_agg_rows_in", li_emitted);
+    TRACE_COUNT("q10_groups_created", (uint64_t)cust_revenue.size());
+    TRACE_COUNT("q10_agg_rows_emitted", (uint64_t)cust_revenue.size());
 
     // Build result rows
     struct ResultRow {
@@ -49,10 +62,16 @@ inline void run_q10_impl(Database* db, std::ostream& out) {
     }
 
     // Order by revenue desc
-    std::sort(results.begin(), results.end(), [](const ResultRow& a, const ResultRow& b) {
-        return a.revenue > b.revenue;
-    });
+    TRACE_COUNT("q10_sort_rows_in", (uint64_t)results.size());
+    {
+        PROFILE_SCOPE("q10_sort");
+        std::sort(results.begin(), results.end(), [](const ResultRow& a, const ResultRow& b) {
+            return a.revenue > b.revenue;
+        });
+    }
+    TRACE_COUNT("q10_sort_rows_out", (uint64_t)results.size());
 
+    PROFILE_SCOPE("q10_output");
     write_csv_header(out, {"c_custkey","c_name","revenue","c_acctbal","n_name","c_address","c_phone","c_comment"});
     for (auto& r : results) {
         int32_t c_idx = r.c_custkey - 1;
@@ -68,4 +87,5 @@ inline void run_q10_impl(Database* db, std::ostream& out) {
             csv_quote(db->c_comment[c_idx])
         });
     }
+    TRACE_COUNT("q10_query_output_rows", (uint64_t)results.size());
 }

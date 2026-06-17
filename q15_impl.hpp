@@ -8,6 +8,9 @@
 #include <algorithm>
 
 inline void run_q15_impl(Database* db, std::ostream& out) {
+    PROFILE_SCOPE("q15_total");
+    TRACE_DECL_COUNTER(li_scanned);
+    TRACE_DECL_COUNTER(li_emitted);
     // CTE revenue: l_shipdate >= '1996-02-01' AND l_shipdate < '1996-05-01'
     const Date date_lo = date_to_epoch(1996, 2, 1);
     const Date date_hi = date_to_epoch(1996, 5, 1);
@@ -15,12 +18,21 @@ inline void run_q15_impl(Database* db, std::ostream& out) {
     // Compute total_revenue per supplier
     std::unordered_map<int32_t, int64_t> supp_revenue; // suppkey → revenue (scale 4)
 
-    for (int64_t i = 0; i < db->n_lineitem; i++) {
-        if (db->l_shipdate[i] >= date_lo && db->l_shipdate[i] < date_hi) {
-            int64_t rev = db->l_extendedprice[i] * (100 - db->l_discount[i]);
-            supp_revenue[db->l_suppkey[i]] += rev;
+    {
+        PROFILE_SCOPE("q15_lineitem_scan_agg");
+        for (int64_t i = 0; i < db->n_lineitem; i++) {
+            TRACE_INC(li_scanned);
+            if (db->l_shipdate[i] >= date_lo && db->l_shipdate[i] < date_hi) {
+                TRACE_INC(li_emitted);
+                int64_t rev = db->l_extendedprice[i] * (100 - db->l_discount[i]);
+                supp_revenue[db->l_suppkey[i]] += rev;
+            }
         }
     }
+    TRACE_COUNT("q15_rows_scanned", li_scanned);
+    TRACE_COUNT("q15_rows_emitted", li_emitted);
+    TRACE_COUNT("q15_agg_rows_in", li_emitted);
+    TRACE_COUNT("q15_groups_created", (uint64_t)supp_revenue.size());
 
     // Find max revenue
     int64_t max_rev = 0;
@@ -41,10 +53,16 @@ inline void run_q15_impl(Database* db, std::ostream& out) {
     }
 
     // Order by s_suppkey
-    std::sort(results.begin(), results.end(), [](const ResultRow& a, const ResultRow& b) {
-        return a.s_suppkey < b.s_suppkey;
-    });
+    TRACE_COUNT("q15_sort_rows_in", (uint64_t)results.size());
+    {
+        PROFILE_SCOPE("q15_sort");
+        std::sort(results.begin(), results.end(), [](const ResultRow& a, const ResultRow& b) {
+            return a.s_suppkey < b.s_suppkey;
+        });
+    }
+    TRACE_COUNT("q15_sort_rows_out", (uint64_t)results.size());
 
+    PROFILE_SCOPE("q15_output");
     write_csv_header(out, {"s_suppkey","s_name","s_address","s_phone","total_revenue"});
     for (auto& r : results) {
         int32_t s_idx = r.s_suppkey - 1;
@@ -56,4 +74,5 @@ inline void run_q15_impl(Database* db, std::ostream& out) {
             fmt_money(r.total_revenue, 4)
         });
     }
+    TRACE_COUNT("q15_query_output_rows", (uint64_t)results.size());
 }

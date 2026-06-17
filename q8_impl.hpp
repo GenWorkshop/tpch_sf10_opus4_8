@@ -11,6 +11,9 @@
 #include <algorithm>
 
 inline void run_q8_impl(Database* db, std::ostream& out) {
+    PROFILE_SCOPE("q8_total");
+    TRACE_DECL_COUNTER(li_scanned);
+    TRACE_DECL_COUNTER(li_emitted);
     // Filter: p_type = 'ECONOMY BRUSHED TIN'
     std::unordered_set<int32_t> matching_partkeys; // 1-based
     for (int32_t i = 0; i < db->n_part; i++) {
@@ -59,28 +62,39 @@ inline void run_q8_impl(Database* db, std::ostream& out) {
     };
     std::map<int32_t, YearAgg> groups;
 
-    for (int64_t i = 0; i < db->n_lineitem; i++) {
-        if (!matching_partkeys.count(db->l_partkey[i])) continue;
+    {
+        PROFILE_SCOPE("q8_lineitem_scan_join_agg");
+        for (int64_t i = 0; i < db->n_lineitem; i++) {
+            TRACE_INC(li_scanned);
+            if (!matching_partkeys.count(db->l_partkey[i])) continue;
 
-        int32_t orderkey = db->l_orderkey[i];
-        if (orderkey > db->max_orderkey) continue;
-        int32_t o_idx = db->orderkey_to_idx[orderkey];
-        if (o_idx < 0) continue;
-        int16_t year = order_year[o_idx];
-        if (year < 0) continue;
+            int32_t orderkey = db->l_orderkey[i];
+            if (orderkey > db->max_orderkey) continue;
+            int32_t o_idx = db->orderkey_to_idx[orderkey];
+            if (o_idx < 0) continue;
+            int16_t year = order_year[o_idx];
+            if (year < 0) continue;
 
-        double volume = (double)db->l_extendedprice[i] * (100 - db->l_discount[i]); // scale 4 units
-        auto& g = groups[year];
-        g.total_volume += volume;
+            TRACE_INC(li_emitted);
+            double volume = (double)db->l_extendedprice[i] * (100 - db->l_discount[i]); // scale 4 units
+            auto& g = groups[year];
+            g.total_volume += volume;
 
-        // Check if supplier nation is FRANCE
-        int32_t suppkey = db->l_suppkey[i];
-        int32_t s_idx = suppkey - 1;
-        if (s_idx >= 0 && s_idx < db->n_supplier && db->s_nationkey[s_idx] == france_nk) {
-            g.france_volume += volume;
+            // Check if supplier nation is FRANCE
+            int32_t suppkey = db->l_suppkey[i];
+            int32_t s_idx = suppkey - 1;
+            if (s_idx >= 0 && s_idx < db->n_supplier && db->s_nationkey[s_idx] == france_nk) {
+                g.france_volume += volume;
+            }
         }
     }
+    TRACE_COUNT("q8_rows_scanned", li_scanned);
+    TRACE_COUNT("q8_join_rows_emitted", li_emitted);
+    TRACE_COUNT("q8_agg_rows_in", li_emitted);
+    TRACE_COUNT("q8_groups_created", (uint64_t)groups.size());
+    TRACE_COUNT("q8_agg_rows_emitted", (uint64_t)groups.size());
 
+    PROFILE_SCOPE("q8_output");
     write_csv_header(out, {"o_year","mkt_share"});
     for (auto& [year, g] : groups) {
         double mkt_share = (g.total_volume == 0) ? 0.0 : g.france_volume / g.total_volume;
@@ -89,4 +103,5 @@ inline void run_q8_impl(Database* db, std::ostream& out) {
             fmt_decimal(mkt_share, 15)
         });
     }
+    TRACE_COUNT("q8_query_output_rows", (uint64_t)groups.size());
 }

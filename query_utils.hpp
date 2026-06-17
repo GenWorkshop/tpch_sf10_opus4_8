@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 #include <initializer_list>
+#include "trace.hpp"
 
 // ---------------------------------------------------------------------------
 // csv_quote — escape a single field value for CSV output

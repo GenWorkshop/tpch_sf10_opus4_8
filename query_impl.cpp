@@ -9,6 +9,7 @@
 
 #include "args_parser.hpp"
 #include "query_utils.hpp"
+#include "cpu_affinity.hpp"
 #include "q1_impl.hpp"
 #include "q2_impl.hpp"
 #include "q3_impl.hpp"
@@ -85,6 +86,10 @@ static QueryFunc get_query_func(const std::string& id) {
 }
 
 void query(Database* db) {
+    // Pin query execution to a single logical CPU (core 3) for deterministic,
+    // low-noise performance measurements.
+    pin_process_to_cpu(3);
+
     std::vector<QueryRequest> requests;
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -111,6 +116,8 @@ void query(Database* db) {
             func(db, req.line, fout);
             fout.close();
 
+            TRACE_FLUSH();
+
             // Also output to stdout
             std::ifstream fin(filename);
             std::cout << fin.rdbuf();
@@ -119,6 +126,8 @@ void query(Database* db) {
             std::cout << "Unknown query: " << req.id << std::endl;
         }
     }
+
+    unpin_process_from_cpus();
 }
 
 // ===== QUERY STUBS =====

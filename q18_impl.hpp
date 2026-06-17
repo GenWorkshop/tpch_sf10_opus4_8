@@ -10,14 +10,23 @@
 #include <algorithm>
 
 inline void run_q18_impl(Database* db, std::ostream& out) {
+    PROFILE_SCOPE("q18_total");
+    TRACE_DECL_COUNTER(li_scanned);
     // First: find orderkeys where sum(l_quantity) > 314 (scale 2: 31400)
     const int64_t qty_threshold = 31400; // 314 * 100
 
     // Compute sum(l_quantity) per orderkey
     std::unordered_map<int32_t, int64_t> order_qty_sum;
-    for (int64_t i = 0; i < db->n_lineitem; i++) {
-        order_qty_sum[db->l_orderkey[i]] += db->l_quantity[i];
+    {
+        PROFILE_SCOPE("q18_lineitem_scan_agg");
+        for (int64_t i = 0; i < db->n_lineitem; i++) {
+            TRACE_INC(li_scanned);
+            order_qty_sum[db->l_orderkey[i]] += db->l_quantity[i];
+        }
     }
+    TRACE_COUNT("q18_rows_scanned", li_scanned);
+    TRACE_COUNT("q18_agg_rows_in", li_scanned);
+    TRACE_COUNT("q18_groups_created", (uint64_t)order_qty_sum.size());
 
     // Filter orders with sum > threshold
     std::unordered_set<int32_t> big_orders;
@@ -26,9 +35,11 @@ inline void run_q18_impl(Database* db, std::ostream& out) {
             big_orders.insert(ok);
         }
     }
+    TRACE_COUNT("q18_big_orders", (uint64_t)big_orders.size());
 
     if (big_orders.empty()) {
         write_csv_header(out, {"c_name","c_custkey","o_orderkey","o_orderdate","o_totalprice","sum(l_quantity)"});
+        TRACE_COUNT("q18_query_output_rows", 0);
         return;
     }
 
@@ -45,30 +56,40 @@ inline void run_q18_impl(Database* db, std::ostream& out) {
     };
     std::vector<ResultRow> results;
 
-    for (int32_t ok : big_orders) {
-        if (ok > db->max_orderkey) continue;
-        int32_t o_idx = db->orderkey_to_idx[ok];
-        if (o_idx < 0) continue;
+    {
+        PROFILE_SCOPE("q18_order_join");
+        for (int32_t ok : big_orders) {
+            if (ok > db->max_orderkey) continue;
+            int32_t o_idx = db->orderkey_to_idx[ok];
+            if (o_idx < 0) continue;
 
-        int32_t custkey = db->o_custkey[o_idx];
-        int32_t c_idx = custkey - 1;
+            int32_t custkey = db->o_custkey[o_idx];
+            int32_t c_idx = custkey - 1;
 
-        results.push_back({
-            db->c_name[c_idx],
-            custkey,
-            ok,
-            db->o_orderdate[o_idx],
-            db->o_totalprice[o_idx],
-            order_qty_sum[ok]
-        });
+            results.push_back({
+                db->c_name[c_idx],
+                custkey,
+                ok,
+                db->o_orderdate[o_idx],
+                db->o_totalprice[o_idx],
+                order_qty_sum[ok]
+            });
+        }
     }
+    TRACE_COUNT("q18_join_rows_emitted", (uint64_t)results.size());
 
     // Order by o_totalprice desc, o_orderdate
-    std::sort(results.begin(), results.end(), [](const ResultRow& a, const ResultRow& b) {
-        if (a.o_totalprice != b.o_totalprice) return a.o_totalprice > b.o_totalprice;
-        return a.o_orderdate < b.o_orderdate;
-    });
+    TRACE_COUNT("q18_sort_rows_in", (uint64_t)results.size());
+    {
+        PROFILE_SCOPE("q18_sort");
+        std::sort(results.begin(), results.end(), [](const ResultRow& a, const ResultRow& b) {
+            if (a.o_totalprice != b.o_totalprice) return a.o_totalprice > b.o_totalprice;
+            return a.o_orderdate < b.o_orderdate;
+        });
+    }
+    TRACE_COUNT("q18_sort_rows_out", (uint64_t)results.size());
 
+    PROFILE_SCOPE("q18_output");
     write_csv_header(out, {"c_name","c_custkey","o_orderkey","o_orderdate","o_totalprice","sum(l_quantity)"});
     for (auto& r : results) {
         write_csv_row(out, {
@@ -80,4 +101,5 @@ inline void run_q18_impl(Database* db, std::ostream& out) {
             fmt_money(r.sum_qty, 2)
         });
     }
+    TRACE_COUNT("q18_query_output_rows", (uint64_t)results.size());
 }
