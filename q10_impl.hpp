@@ -124,7 +124,24 @@ inline void run_q10_impl(Database* db, std::ostream& out) {
         buf.push_back('"');
     };
 
-    for (auto& r : results) {
+    const size_t nres = results.size();
+    const int PD_FAR = 32;
+    const int PD_NEAR = 10;
+    for (size_t i = 0; i < nres; i++) {
+        if (i + PD_FAR < nres) {
+            int32_t fidx = results[i + PD_FAR].c_custkey - 1;
+            __builtin_prefetch(&db->c_name[fidx]);
+            __builtin_prefetch(&db->c_address[fidx]);
+            __builtin_prefetch(&db->c_phone[fidx]);
+            __builtin_prefetch(&db->c_comment[fidx]);
+        }
+        if (i + PD_NEAR < nres) {
+            int32_t nidx = results[i + PD_NEAR].c_custkey - 1;
+            __builtin_prefetch(db->c_name[nidx].data());
+            __builtin_prefetch(db->c_address[nidx].data());
+            __builtin_prefetch(db->c_comment[nidx].data());
+        }
+        const ResultRow& r = results[i];
         int32_t c_idx = r.c_custkey - 1;
         int32_t nk = db->c_nationkey[c_idx];
         append_int(r.c_custkey);            buf.push_back(',');
