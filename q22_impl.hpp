@@ -23,16 +23,33 @@ inline void run_q22_impl(Database* db, std::ostream& out) {
         }
     }
 
-    // Pass 1 over customers: gather candidates with target phone prefix and
-    // accumulate avg(c_acctbal) for acctbal > 0 (the scalar subquery).
-    struct Cand { int32_t custkey; int64_t acctbal; uint16_t code; };
+    // Anti-join against orders: cache-resident bitmap indexed by custkey marks
+    // the existence of any order for that customer (RIGHT_ANTI semantics).
+    // One bit per customer keeps the working set in L2 (~187KB at sf10).
+    std::vector<uint64_t> has_orders((db->n_customer >> 6) + 2, 0);
+    {
+        PROFILE_SCOPE("q22_orders_scan");
+        const int32_t no = db->n_orders;
+        const int32_t* oc = db->o_custkey.data();
+        uint64_t* bm = has_orders.data();
+        for (int32_t i = 0; i < no; i++) {
+            uint32_t k = (uint32_t)oc[i];
+            bm[k >> 6] |= (uint64_t)1 << (k & 63);
+        }
+    }
+
+    // Single customer pass (custkey == i+1, so the anti-join probe is a
+    // sequential bit read): accumulate avg(c_acctbal) for the scalar subquery
+    // over all prefix matches, and stash prefix-matched no-order customers.
+    struct Cand { int64_t acctbal; uint16_t code; };
     std::vector<Cand> cands;
-    cands.reserve(4096);
+    cands.reserve((size_t)db->n_customer / 4 + 16);
     int64_t sum_bal = 0;
     int64_t count_bal = 0;
     {
         PROFILE_SCOPE("q22_customer_scan_filter_agg");
         const int32_t n = db->n_customer;
+        const uint64_t* bm = has_orders.data();
         for (int32_t i = 0; i < n; i++) {
             TRACE_INC(cust_scanned);
             const std::string& ph = db->c_phone[i];
@@ -43,22 +60,12 @@ inline void run_q22_impl(Database* db, std::ostream& out) {
                 sum_bal += bal;
                 count_bal++;
             }
-            cands.push_back({i + 1, bal, code});
+            uint32_t k = (uint32_t)(i + 1);
+            if ((bm[k >> 6] >> (k & 63)) & 1) continue;
+            cands.push_back({bal, code});
         }
     }
     double avg_bal = (count_bal > 0) ? (double)sum_bal / count_bal : 0.0;
-
-    // Anti-join against orders: flat byte array indexed by custkey marks the
-    // existence of any order for that customer (RIGHT_ANTI semantics).
-    std::vector<uint8_t> has_orders(db->n_customer + 1, 0);
-    {
-        PROFILE_SCOPE("q22_orders_scan");
-        const int32_t no = db->n_orders;
-        const int32_t* oc = db->o_custkey.data();
-        for (int32_t i = 0; i < no; i++) {
-            has_orders[oc[i]] = 1;
-        }
-    }
 
     struct Agg {
         int64_t numcust = 0;
@@ -69,7 +76,6 @@ inline void run_q22_impl(Database* db, std::ostream& out) {
         PROFILE_SCOPE("q22_candidate_agg");
         for (const Cand& c : cands) {
             if ((double)c.acctbal <= avg_bal) continue;
-            if (has_orders[c.custkey]) continue;
             TRACE_INC(cust_emitted);
             char buf[2] = {(char)(c.code >> 8), (char)(c.code & 0xFF)};
             std::string code(buf, 2);
