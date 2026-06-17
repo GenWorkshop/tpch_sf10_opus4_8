@@ -67,31 +67,34 @@ inline void __attribute__((target("avx2"))) run_q1_impl(Database* db, std::ostre
         const __m128i vmax  = _mm_set1_epi32(cutoff);
         const __m128i vones = _mm_set1_epi32(-1);
 
-        alignas(32) int64_t mqty[4], mbase[4], mdp[4], mchg[4], mdisc[4], mmask[4];
+        alignas(32) int64_t mqty[8], mbase[8], mdp[8], mchg[8], mdisc[8], mmask[8];
+
+        #define Q1_COMPUTE(I, OFF)                                                           \
+            {                                                                                \
+                __m128i shp   = _mm_loadu_si128((const __m128i*)(ship + (I)));               \
+                __m128i gt    = _mm_cmpgt_epi32(shp, vmax);                                  \
+                __m128i pass  = _mm_xor_si128(gt, vones);                                    \
+                __m256i mask  = _mm256_cvtepi32_epi64(pass);                                 \
+                __m256i price = _mm256_loadu_si256((const __m256i*)(prA + (I)));             \
+                __m256i disc  = _mm256_loadu_si256((const __m256i*)(dscA + (I)));            \
+                __m256i tax_  = _mm256_loadu_si256((const __m256i*)(taxA + (I)));            \
+                __m256i qty   = _mm256_loadu_si256((const __m256i*)(qtyA + (I)));            \
+                __m256i omd   = _mm256_sub_epi64(v100, disc);                                \
+                __m256i opt   = _mm256_add_epi64(v100, tax_);                                \
+                __m256i dpr   = _mm256_mul_epi32(price, omd);                                \
+                __m256i chg   = _mm256_mul_epi32(dpr, opt);                                  \
+                _mm256_store_si256((__m256i*)(mqty + (OFF)),  _mm256_and_si256(qty, mask));  \
+                _mm256_store_si256((__m256i*)(mbase + (OFF)), _mm256_and_si256(price, mask));\
+                _mm256_store_si256((__m256i*)(mdp + (OFF)),   _mm256_and_si256(dpr, mask));  \
+                _mm256_store_si256((__m256i*)(mchg + (OFF)),  _mm256_and_si256(chg, mask));  \
+                _mm256_store_si256((__m256i*)(mdisc + (OFF)), _mm256_and_si256(disc, mask)); \
+                _mm256_store_si256((__m256i*)(mmask + (OFF)), mask);                         \
+            }
 
         int64_t i = 0;
-        for (; i + 4 <= n; i += 4) {
-            __m128i shp   = _mm_loadu_si128((const __m128i*)(ship + i));
-            __m128i gt    = _mm_cmpgt_epi32(shp, vmax);            // shipdate > cutoff
-            __m128i pass  = _mm_xor_si128(gt, vones);              // shipdate <= cutoff
-            __m256i mask  = _mm256_cvtepi32_epi64(pass);           // 4x 64-bit 0/-1
-
-            __m256i price = _mm256_loadu_si256((const __m256i*)(prA + i));
-            __m256i disc  = _mm256_loadu_si256((const __m256i*)(dscA + i));
-            __m256i tax_  = _mm256_loadu_si256((const __m256i*)(taxA + i));
-            __m256i qty   = _mm256_loadu_si256((const __m256i*)(qtyA + i));
-
-            __m256i one_minus_disc = _mm256_sub_epi64(v100, disc);
-            __m256i one_plus_tax   = _mm256_add_epi64(v100, tax_);
-            __m256i disc_price = _mm256_mul_epi32(price, one_minus_disc);
-            __m256i charge     = _mm256_mul_epi32(disc_price, one_plus_tax);
-
-            _mm256_store_si256((__m256i*)mqty,  _mm256_and_si256(qty, mask));
-            _mm256_store_si256((__m256i*)mbase, _mm256_and_si256(price, mask));
-            _mm256_store_si256((__m256i*)mdp,   _mm256_and_si256(disc_price, mask));
-            _mm256_store_si256((__m256i*)mchg,  _mm256_and_si256(charge, mask));
-            _mm256_store_si256((__m256i*)mdisc, _mm256_and_si256(disc, mask));
-            _mm256_store_si256((__m256i*)mmask, mask);
+        for (; i + 8 <= n; i += 8) {
+            Q1_COMPUTE(i, 0)
+            Q1_COMPUTE(i + 4, 4)
 
             #define Q1_SCATTER(J, TBL)                                       \
                 {                                                            \
@@ -108,8 +111,13 @@ inline void __attribute__((target("avx2"))) run_q1_impl(Database* db, std::ostre
             Q1_SCATTER(1, t1)
             Q1_SCATTER(2, t0)
             Q1_SCATTER(3, t1)
+            Q1_SCATTER(4, t0)
+            Q1_SCATTER(5, t1)
+            Q1_SCATTER(6, t0)
+            Q1_SCATTER(7, t1)
             #undef Q1_SCATTER
         }
+        #undef Q1_COMPUTE
 
         // Scalar tail.
         for (; i < n; i++) {
