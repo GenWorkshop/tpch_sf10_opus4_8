@@ -4,6 +4,7 @@
 #include <ostream>
 #include <vector>
 #include <algorithm>
+#include <climits>
 
 // TPC-H Q21.  RUSSIA suppliers that are the SOLE late supplier on a multi-
 // supplier 'F' order.  The DuckDB plan groups lineitem by (l_orderkey) and
@@ -35,60 +36,137 @@ inline void run_q21_impl(Database* db, std::ostream& out) {
 
     const int32_t maxok = db->max_orderkey;
 
-    // o_orderstatus = 'F', indexed by orderkey.
-    std::vector<uint8_t> order_is_F(maxok + 1, 0);
-    for (int32_t i = 0; i < db->n_orders; i++) {
-        if (db->o_orderstatus[i] == 'F') order_is_F[db->o_orderkey[i]] = 1;
-    }
-
-    // Per-order aggregates, indexed by orderkey.
-    std::vector<int32_t> first_supp(maxok + 1, 0);
-    std::vector<int32_t> late_supp(maxok + 1, 0);
-    std::vector<uint8_t> flag(maxok + 1, 0);
-
-    {
-        PROFILE_SCOPE("q21_lineitem_scan_join");
-        const int32_t* __restrict ok_col = db->l_orderkey.data();
-        const int32_t* __restrict sk_col = db->l_suppkey.data();
-        const Date* __restrict rcpt = db->l_receiptdate.data();
-        const Date* __restrict cmit = db->l_commitdate.data();
-        const int64_t n = db->n_lineitem;
-        for (int64_t i = 0; i < n; i++) {
-            TRACE_INC(li_scanned);
-            const int32_t ok = ok_col[i];
-            if (ok > maxok || !order_is_F[ok]) continue;
-            TRACE_INC(li_emitted);
-
-            const int32_t sk = sk_col[i];
-            const int32_t fs = first_supp[ok];
-            if (fs == 0) first_supp[ok] = sk;
-            else if (sk != fs) flag[ok] |= 1;
-
-            if (rcpt[i] > cmit[i]) {
-                const int32_t ls = late_supp[ok];
-                if (ls == 0) late_supp[ok] = sk;
-                else if (sk != ls) flag[ok] |= 2;
-            }
-        }
-    }
-    TRACE_COUNT("q21_rows_scanned", li_scanned);
-    TRACE_COUNT("q21_join_rows_emitted", li_emitted);
-
     // numwait per supplier, dense indexed by suppkey (1-based).
     std::vector<int64_t> supp_numwait(db->n_supplier + 1, 0);
+
+    const int32_t* __restrict ok_col = db->l_orderkey.data();
+    const int32_t* __restrict sk_col = db->l_suppkey.data();
+    const Date* __restrict rcpt = db->l_receiptdate.data();
+    const Date* __restrict cmit = db->l_commitdate.data();
+    const int64_t n = db->n_lineitem;
+
+    if (db->lineitem_sorted_by_orderkey && db->orders_sorted_by_orderkey) {
+        // Both tables clustered by orderkey: merge-walk them in lockstep.  The
+        // 'F' status is read sequentially from o_orderstatus (no 60MB
+        // orderkey-indexed bitmap to build or scatter-read).  The per-run
+        // reduction is branchless via running min/max:
+        //   multi      (>=2 suppliers)      == (max_sk != min_sk)
+        //   late_supp  (sole late supplier) == late_min (== late_max)
+        PROFILE_SCOPE("q21_lineitem_scan_join");
+        const char* __restrict o_stat = db->o_orderstatus.data();
+        const int32_t* __restrict o_okey = db->o_orderkey.data();
+        const int32_t n_ord = db->n_orders;
+        int32_t oj = 0;
+        int64_t i = 0;
+        while (i < n) {
+            const int32_t ok = ok_col[i];
+            while (oj < n_ord && o_okey[oj] < ok) oj++;
+            const bool isF = (oj < n_ord && o_okey[oj] == ok && o_stat[oj] == 'F');
+            if (!isF) {
+                do { i++; } while (i < n && ok_col[i] == ok);
+                continue;
+            }
+            int32_t min_sk = INT32_MAX, max_sk = 0;
+            int32_t late_min = INT32_MAX, late_max = 0;
+            do {
+                const int32_t sk = sk_col[i];
+                min_sk = std::min(min_sk, sk);
+                max_sk = std::max(max_sk, sk);
+                const bool late = rcpt[i] > cmit[i];
+                late_min = std::min(late_min, late ? sk : INT32_MAX);
+                late_max = std::max(late_max, late ? sk : 0);
+                i++;
+            } while (i < n && ok_col[i] == ok);
+
+            if (max_sk != min_sk &&            // >=2 distinct suppliers (EXISTS)
+                late_max != 0 &&               // at least one late supplier
+                late_max == late_min &&        // exactly one late supplier
+                is_russia[late_min])
+                supp_numwait[late_min]++;
+        }
+        TRACE_COUNT("q21_rows_scanned", li_scanned);
+        TRACE_COUNT("q21_join_rows_emitted", li_emitted);
+        goto finalize;
+    }
+
     {
+    // o_orderstatus = 'F', indexed by orderkey.
+    std::vector<uint8_t> order_is_F(maxok + 1, 0);
+    {
+        PROFILE_SCOPE("q21_build_order_is_F");
+        for (int32_t i = 0; i < db->n_orders; i++) {
+            if (db->o_orderstatus[i] == 'F') order_is_F[db->o_orderkey[i]] = 1;
+        }
+    }
+
+    if (db->lineitem_sorted_by_orderkey) {
+        // Lineitem clustered by orderkey but orders not: run-walk lineitem,
+        // reading F-status from the orderkey-indexed bitmap.
+        PROFILE_SCOPE("q21_lineitem_scan_join");
+        int64_t i = 0;
+        while (i < n) {
+            const int32_t ok = ok_col[i];
+            if (!order_is_F[ok]) {                 // skip non-'F' orders cheaply
+                do { i++; } while (i < n && ok_col[i] == ok);
+                continue;
+            }
+            int32_t min_sk = INT32_MAX, max_sk = 0;
+            int32_t late_min = INT32_MAX, late_max = 0;
+            do {
+                const int32_t sk = sk_col[i];
+                min_sk = std::min(min_sk, sk);
+                max_sk = std::max(max_sk, sk);
+                const bool late = rcpt[i] > cmit[i];
+                late_min = std::min(late_min, late ? sk : INT32_MAX);
+                late_max = std::max(late_max, late ? sk : 0);
+                i++;
+            } while (i < n && ok_col[i] == ok);
+
+            if (max_sk != min_sk &&
+                late_max != 0 &&
+                late_max == late_min &&
+                is_russia[late_min])
+                supp_numwait[late_min]++;
+        }
+    } else {
+        // Fallback: dense per-order arrays indexed by orderkey.
+        std::vector<int32_t> first_supp(maxok + 1, 0);
+        std::vector<int32_t> late_supp(maxok + 1, 0);
+        std::vector<uint8_t> flag(maxok + 1, 0);
+        {
+            PROFILE_SCOPE("q21_lineitem_scan_join");
+            for (int64_t i = 0; i < n; i++) {
+                const int32_t ok = ok_col[i];
+                if (ok > maxok || !order_is_F[ok]) continue;
+                TRACE_INC(li_emitted);
+                const int32_t sk = sk_col[i];
+                const int32_t fs = first_supp[ok];
+                if (fs == 0) first_supp[ok] = sk;
+                else if (sk != fs) flag[ok] |= 1;
+                if (rcpt[i] > cmit[i]) {
+                    const int32_t ls = late_supp[ok];
+                    if (ls == 0) late_supp[ok] = sk;
+                    else if (sk != ls) flag[ok] |= 2;
+                }
+            }
+        }
         PROFILE_SCOPE("q21_order_agg");
         for (int32_t j = 0; j < db->n_orders; j++) {
             if (db->o_orderstatus[j] != 'F') continue;
             const int32_t ok = db->o_orderkey[j];
             const uint8_t f = flag[ok];
-            if (!(f & 1)) continue;            // need another supplier (EXISTS)
-            if (f & 2) continue;               // 2+ late suppliers kills it
+            if (!(f & 1)) continue;
+            if (f & 2) continue;
             const int32_t ls = late_supp[ok];
-            if (ls == 0) continue;             // no late supplier
+            if (ls == 0) continue;
             if (is_russia[ls]) supp_numwait[ls]++;
         }
     }
+    TRACE_COUNT("q21_rows_scanned", li_scanned);
+    TRACE_COUNT("q21_join_rows_emitted", li_emitted);
+    }
+
+finalize: ;
 
     struct ResultRow {
         const std::string* s_name;
