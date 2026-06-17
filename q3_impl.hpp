@@ -50,9 +50,7 @@ inline void run_q3_impl(Database* db, std::ostream& out) {
     // Step 2: Qualifying orders (customer in BUILDING, orderdate < 1995-03-08).
     // Build a compact qualifies-bitmap indexed by orderkey (~max_orderkey/8
     // bytes, L3-resident) used to cheaply gate the lineitem scan before doing
-    // any large random gathers. Branchless append avoids ~50% branch
-    // mispredictions on the orderdate filter.
-    std::vector<int32_t> qual_orders(db->n_orders);
+    // any large random gathers.
     std::vector<uint64_t> qbits((size_t)(db->max_orderkey) / 64 + 1, 0);
     size_t qcount = 0;
     { PROFILE_SCOPE("q3_p2_orders");
@@ -60,22 +58,19 @@ inline void run_q3_impl(Database* db, std::ostream& out) {
     const int32_t* __restrict ock = db->o_custkey.data();
     const int32_t* __restrict ook = db->o_orderkey.data();
     const uint64_t* __restrict cb = cust_building.data();
-    int32_t* __restrict qo = qual_orders.data();
     uint64_t* __restrict qbp = qbits.data();
     const int32_t n = db->n_orders;
     for (int32_t i = 0; i < n; i++) {
         uint32_t c = (uint32_t)(ock[i] - 1);
         unsigned bld = (unsigned)((cb[c >> 6] >> (c & 63)) & 1);
         unsigned pass = (unsigned)(od[i] < date_filter) & bld;
-        qo[qcount] = i;
-        qcount += pass;
         if (pass) {
+            qcount++;
             uint32_t ok = (uint32_t)ook[i];
             qbp[ok >> 6] |= (uint64_t)1 << (ok & 63);
         }
     }
     }
-    qual_orders.resize(qcount);
 
     struct ResultRow {
         int32_t orderkey;
