@@ -27,12 +27,14 @@ static void run_q1(Database* db, const std::string& run_nr) {
     const int32_t max_shipdate = date_to_days(1998, 8, 23);
 
     // Group key: (returnflag, linestatus) -> 2 chars
+    // All sums fit comfortably in int64 even at large scale factors
+    // (sum_charge worst case ~5e16 << 9.2e18), so we avoid __int128 entirely.
     struct Agg {
-        __int128 sum_qty = 0;        // sum of l_quantity (in cents, scale 2)
-        __int128 sum_base_price = 0; // sum of l_extendedprice (scale 2)
-        __int128 sum_disc_price = 0; // sum of price*(1-discount) (scale 4)
-        __int128 sum_charge = 0;     // sum of price*(1-disc)*(1+tax) (scale 6)
-        __int128 sum_discount = 0;   // for avg (scale 2)
+        int64_t sum_qty = 0;        // scale 2
+        int64_t sum_base_price = 0; // scale 2
+        int64_t sum_disc_price = 0; // scale 4
+        int64_t sum_charge = 0;     // scale 6
+        int64_t sum_discount = 0;   // scale 2
         int64_t count = 0;
     };
 
@@ -70,7 +72,7 @@ static void run_q1(Database* db, const std::string& run_nr) {
 
                 agg.sum_qty += qty;
                 agg.sum_base_price += price;
-                __int128 disc_price = (__int128)price * (100 - disc);
+                int64_t disc_price = price * (100 - disc);
                 agg.sum_disc_price += disc_price;
                 agg.sum_charge += disc_price * (100 + tx);
                 agg.sum_discount += disc;
