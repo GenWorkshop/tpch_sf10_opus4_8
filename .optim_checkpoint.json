@@ -13,6 +13,7 @@
   "current_query": "q9",
   "completed_stages": [
     "sample_plan",
-    "trace"
+    "trace",
+    "expert_knowledge"
   ]
 }
