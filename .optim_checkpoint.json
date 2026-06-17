@@ -17,13 +17,9 @@
     "q14",
     "q15",
     "q16",
-    "q17"
+    "q17",
+    "q18"
   ],
-  "current_query": "q18",
-  "completed_stages": [
-    "sample_plan",
-    "trace",
-    "expert_knowledge",
-    "human_reference"
-  ]
+  "current_query": "q19",
+  "completed_stages": []
 }
