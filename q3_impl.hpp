@@ -141,14 +141,70 @@ inline void run_q3_impl(Database* db, std::ostream& out) {
 
     // Output
     PROFILE_SCOPE("q3_output");
-    write_csv_header(out, {"l_orderkey","revenue","o_orderdate","o_shippriority"});
+    std::string buf;
+    buf.reserve(results.size() * 40 + 64);
+    buf += "l_orderkey,revenue,o_orderdate,o_shippriority\n";
+    char tmp[32];
     for (auto& r : results) {
-        write_csv_row(out, {
-            std::to_string(r.orderkey),
-            fmt_money(r.revenue, 4),
-            format_date(r.o_orderdate),
-            std::to_string(r.o_shippriority)
-        });
+        // l_orderkey
+        {
+            char* p = tmp + sizeof(tmp);
+            int32_t v = r.orderkey;
+            do { *--p = char('0' + v % 10); v /= 10; } while (v);
+            buf.append(p, tmp + sizeof(tmp) - p);
+        }
+        buf.push_back(',');
+        // revenue (fixed-point, scale 4)
+        {
+            int64_t v = r.revenue; // always > 0 here
+            int64_t whole = v / 10000;
+            int frac = (int)(v % 10000);
+            char* p = tmp + sizeof(tmp);
+            *--p = char('0' + frac % 10); frac /= 10;
+            *--p = char('0' + frac % 10); frac /= 10;
+            *--p = char('0' + frac % 10); frac /= 10;
+            *--p = char('0' + frac);
+            *--p = '.';
+            do { *--p = char('0' + whole % 10); whole /= 10; } while (whole);
+            buf.append(p, tmp + sizeof(tmp) - p);
+        }
+        buf.push_back(',');
+        // o_orderdate (YYYY-MM-DD)
+        {
+            int32_t days = r.o_orderdate;
+            int32_t z = days + 719468;
+            int32_t era = (z >= 0 ? z : z - 146096) / 146097;
+            unsigned doe = static_cast<unsigned>(z - era * 146097);
+            unsigned yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+            int y = static_cast<int>(yoe) + era * 400;
+            unsigned doy = doe - (365*yoe + yoe/4 - yoe/100);
+            unsigned mp = (5*doy + 2) / 153;
+            unsigned d = doy - (153*mp + 2)/5 + 1;
+            unsigned m = mp + (mp < 10 ? 3 : -9);
+            y += (m <= 2);
+            char* p = tmp;
+            *p++ = char('0' + (y / 1000) % 10);
+            *p++ = char('0' + (y / 100) % 10);
+            *p++ = char('0' + (y / 10) % 10);
+            *p++ = char('0' + y % 10);
+            *p++ = '-';
+            *p++ = char('0' + m / 10);
+            *p++ = char('0' + m % 10);
+            *p++ = '-';
+            *p++ = char('0' + d / 10);
+            *p++ = char('0' + d % 10);
+            buf.append(tmp, p - tmp);
+        }
+        buf.push_back(',');
+        // o_shippriority
+        {
+            char* p = tmp + sizeof(tmp);
+            int32_t v = r.o_shippriority;
+            do { *--p = char('0' + v % 10); v /= 10; } while (v);
+            buf.append(p, tmp + sizeof(tmp) - p);
+        }
+        buf.push_back('\n');
     }
+    out.write(buf.data(), buf.size());
     TRACE_COUNT("q3_query_output_rows", (uint64_t)results.size());
 }
