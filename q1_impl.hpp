@@ -4,6 +4,7 @@
 #include <ostream>
 #include <algorithm>
 #include <map>
+#include <immintrin.h>
 
 // Convert yyyy-mm-dd to days since epoch (1970-01-01)
 inline int32_t date_to_epoch(int y, int m, int d) {
@@ -16,7 +17,7 @@ inline int32_t date_to_epoch(int y, int m, int d) {
     return era * 146097 + static_cast<int>(doe) - 719468;
 }
 
-inline void run_q1_impl(Database* db, std::ostream& out) {
+inline void __attribute__((target("avx2"))) run_q1_impl(Database* db, std::ostream& out) {
     PROFILE_SCOPE("q1_total");
     // l_shipdate <= '1998-12-01' - 100 days = '1998-08-23'
     const Date cutoff = date_to_epoch(1998, 8, 23);
@@ -36,8 +37,12 @@ inline void run_q1_impl(Database* db, std::ostream& out) {
     };
 
     constexpr int N_SLOTS = 26 * 26;
-    static thread_local Agg slots[N_SLOTS];
-    for (int s = 0; s < N_SLOTS; s++) slots[s] = Agg{};
+    // Two independent accumulator banks: adjacent rows scatter into different
+    // banks to break the read-modify-write dependency chain when consecutive
+    // rows fall into the same group.  Merged after the scan.
+    static thread_local Agg t0[N_SLOTS];
+    static thread_local Agg t1[N_SLOTS];
+    for (int s = 0; s < N_SLOTS; s++) { t0[s] = Agg{}; t1[s] = Agg{}; }
 
     const Date*    __restrict ship  = db->l_shipdate.data();
     const char*    __restrict rf    = db->l_returnflag.data();
@@ -47,40 +52,93 @@ inline void run_q1_impl(Database* db, std::ostream& out) {
     const int64_t* __restrict dscA  = db->l_discount.data();
     const int64_t* __restrict taxA  = db->l_tax.data();
 
-    TRACE_DECL_COUNTER(rows_scanned);
-    TRACE_DECL_COUNTER(rows_emitted);
     {
         PROFILE_SCOPE("q1_scan_agg");
         const int64_t n = db->n_lineitem;
-        for (int64_t i = 0; i < n; i++) {
-            TRACE_INC(rows_scanned);
+
+        // AVX2 vectorised scan: 4 rows per iteration.  256-bit loads raise
+        // memory-level parallelism; the arithmetic (subtract, two multiplies,
+        // masking) runs 4-wide.  l_extendedprice < 2^31 and the intermediate
+        // disc_price < 2^31, so both products fit the signed 32x32->64
+        // multiply (_mm256_mul_epi32).  Rows failing the date filter are
+        // zero-masked, so they contribute nothing even though the (scalar)
+        // scatter still routes them to their group slot.
+        const __m256i v100  = _mm256_set1_epi64x(100);
+        const __m128i vmax  = _mm_set1_epi32(cutoff);
+        const __m128i vones = _mm_set1_epi32(-1);
+
+        alignas(32) int64_t mqty[4], mbase[4], mdp[4], mchg[4], mdisc[4], mmask[4];
+
+        int64_t i = 0;
+        for (; i + 4 <= n; i += 4) {
+            __m128i shp   = _mm_loadu_si128((const __m128i*)(ship + i));
+            __m128i gt    = _mm_cmpgt_epi32(shp, vmax);            // shipdate > cutoff
+            __m128i pass  = _mm_xor_si128(gt, vones);              // shipdate <= cutoff
+            __m256i mask  = _mm256_cvtepi32_epi64(pass);           // 4x 64-bit 0/-1
+
+            __m256i price = _mm256_loadu_si256((const __m256i*)(prA + i));
+            __m256i disc  = _mm256_loadu_si256((const __m256i*)(dscA + i));
+            __m256i tax_  = _mm256_loadu_si256((const __m256i*)(taxA + i));
+            __m256i qty   = _mm256_loadu_si256((const __m256i*)(qtyA + i));
+
+            __m256i one_minus_disc = _mm256_sub_epi64(v100, disc);
+            __m256i one_plus_tax   = _mm256_add_epi64(v100, tax_);
+            __m256i disc_price = _mm256_mul_epi32(price, one_minus_disc);
+            __m256i charge     = _mm256_mul_epi32(disc_price, one_plus_tax);
+
+            _mm256_store_si256((__m256i*)mqty,  _mm256_and_si256(qty, mask));
+            _mm256_store_si256((__m256i*)mbase, _mm256_and_si256(price, mask));
+            _mm256_store_si256((__m256i*)mdp,   _mm256_and_si256(disc_price, mask));
+            _mm256_store_si256((__m256i*)mchg,  _mm256_and_si256(charge, mask));
+            _mm256_store_si256((__m256i*)mdisc, _mm256_and_si256(disc, mask));
+            _mm256_store_si256((__m256i*)mmask, mask);
+
+            #define Q1_SCATTER(J, TBL)                                       \
+                {                                                            \
+                    int idx = (rf[i + (J)] - 'A') * 26 + (ls[i + (J)] - 'A');\
+                    Agg& g = TBL[idx];                                       \
+                    g.sum_qty        += mqty[J];                             \
+                    g.sum_base_price += mbase[J];                            \
+                    g.sum_disc_price += mdp[J];                              \
+                    g.sum_charge     += mchg[J];                             \
+                    g.sum_disc       += mdisc[J];                            \
+                    g.count          += (mmask[J] & 1);                      \
+                }
+            Q1_SCATTER(0, t0)
+            Q1_SCATTER(1, t1)
+            Q1_SCATTER(2, t0)
+            Q1_SCATTER(3, t1)
+            #undef Q1_SCATTER
+        }
+
+        // Scalar tail.
+        for (; i < n; i++) {
             if (ship[i] <= cutoff) {
-                TRACE_INC(rows_emitted);
                 int idx = (rf[i] - 'A') * 26 + (ls[i] - 'A');
-                Agg& g = slots[idx];
-
-                int64_t qty = qtyA[i];     // scale 2
-                int64_t price = prA[i];    // scale 2
-                int64_t disc = dscA[i];    // scale 2 (e.g., 0.05 = 5)
-                int64_t tax = taxA[i];     // scale 2
-
-                g.sum_qty += qty;
-                g.sum_base_price += price;
-
+                Agg& g = t0[idx];
+                int64_t price = prA[i];
+                int64_t disc = dscA[i];
                 int64_t disc_price = price * (100 - disc);
+                g.sum_qty        += qtyA[i];
+                g.sum_base_price += price;
                 g.sum_disc_price += disc_price;
-
-                g.sum_charge += disc_price * (100 + tax);
-
-                g.sum_disc += disc;
+                g.sum_charge     += disc_price * (100 + taxA[i]);
+                g.sum_disc       += disc;
                 g.count++;
             }
         }
     }
 
-    TRACE_COUNT("q1_rows_scanned", rows_scanned);
-    TRACE_COUNT("q1_rows_emitted", rows_emitted);
-    TRACE_COUNT("q1_agg_rows_in", rows_emitted);
+    // Merge the two banks into t0.
+    Agg* __restrict slots = t0;
+    for (int s = 0; s < N_SLOTS; s++) {
+        slots[s].sum_qty        += t1[s].sum_qty;
+        slots[s].sum_base_price += t1[s].sum_base_price;
+        slots[s].sum_disc_price += t1[s].sum_disc_price;
+        slots[s].sum_charge     += t1[s].sum_charge;
+        slots[s].sum_disc       += t1[s].sum_disc;
+        slots[s].count          += t1[s].count;
+    }
 
     PROFILE_SCOPE("q1_output");
     write_csv_header(out, {"l_returnflag","l_linestatus","sum_qty","sum_base_price",
