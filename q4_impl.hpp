@@ -7,8 +7,25 @@
 #include <vector>
 #include <map>
 #include <unordered_set>
+#include <immintrin.h>
 
-inline void run_q4_impl(Database* db, std::ostream& out) {
+// 256-entry left-pack permutation table for AVX2 compaction of 8x int32 lanes.
+inline const int32_t* q4_leftpack_table() {
+    static int32_t tbl[256][8];
+    static bool init = [] {
+        for (int m = 0; m < 256; m++) {
+            int pos = 0;
+            for (int l = 0; l < 8; l++)
+                if (m & (1 << l)) tbl[m][pos++] = l;
+            for (; pos < 8; pos++) tbl[m][pos] = 0;
+        }
+        return true;
+    }();
+    (void)init;
+    return &tbl[0][0];
+}
+
+inline void __attribute__((target("avx2"))) run_q4_impl(Database* db, std::ostream& out) {
     PROFILE_SCOPE("q4_total");
     TRACE_DECL_COUNTER(orders_scanned);
     TRACE_DECL_COUNTER(orders_emitted);
@@ -29,54 +46,77 @@ inline void run_q4_impl(Database* db, std::ostream& out) {
         const Date* __restrict lc = db->l_commitdate.data();
         const Date* __restrict lr = db->l_receiptdate.data();
 
-        // Phase 1: tight sequential scan of the date column, collecting the
-        // (sparse, ~3.8%) order rows that pass the date filter. Branchless
-        // append avoids misprediction on the selective predicate.
-        std::vector<int32_t> pass(db->n_orders);
+        // Phase 1: scan the date column, collecting the (sparse, ~3.8%) order
+        // rows that pass the date filter. AVX2 range-check via the
+        // (unsigned)(d - lo) < (hi - lo) trick + left-pack compaction.
+        std::vector<int32_t> pass(db->n_orders + 8);
         int32_t* __restrict pbuf = pass.data();
         size_t npass = 0;
         {
             PROFILE_SCOPE("q4_orders_date_filter");
-            for (int32_t i = 0; i < db->n_orders; i++) {
-                TRACE_INC(orders_scanned);
+            const int32_t* tbl = q4_leftpack_table();
+            const uint32_t range = (uint32_t)(date_hi - date_lo);
+            const __m256i vlo = _mm256_set1_epi32(date_lo);
+            const __m256i vsign = _mm256_set1_epi32((int)0x80000000);
+            const __m256i vrange_x = _mm256_set1_epi32((int)(range ^ 0x80000000u));
+            const __m256i viota = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+            int32_t i = 0;
+            int32_t n8 = db->n_orders & ~7;
+            for (; i < n8; i += 8) {
+                __m256i d = _mm256_loadu_si256((const __m256i*)(odate + i));
+                __m256i sub = _mm256_sub_epi32(d, vlo);
+                __m256i sub_x = _mm256_xor_si256(sub, vsign);
+                __m256i mask = _mm256_cmpgt_epi32(vrange_x, sub_x);
+                unsigned m = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(mask));
+                __m256i vidx = _mm256_add_epi32(_mm256_set1_epi32(i), viota);
+                __m256i perm = _mm256_loadu_si256((const __m256i*)(tbl + m * 8));
+                __m256i packed = _mm256_permutevar8x32_epi32(vidx, perm);
+                _mm256_storeu_si256((__m256i*)(pbuf + npass), packed);
+                npass += (size_t)__builtin_popcount(m);
+            }
+            for (; i < db->n_orders; i++) {
                 Date d = odate[i];
                 pbuf[npass] = i;
-                npass += (size_t)(d >= date_lo && d < date_hi);
+                npass += (size_t)((uint32_t)(d - date_lo) < range);
+            }
+            TRACE_ADD(orders_scanned, db->n_orders);
+        }
+
+        const int n = (int)npass;
+
+        // Phase 2a: gather each passing order's lineitem [start,end) range into a
+        // compact array. The CSR gather is the only random access here and is
+        // hidden by an independent prefetch stream (no dependent loads).
+        std::vector<Database::LineitemRange> rng(n);
+        {
+            PROFILE_SCOPE("q4_range_gather");
+            const int PA = 128;
+            for (int k = 0; k < n; k++) {
+                if (k + PA < n) __builtin_prefetch(&lrng[okey[pbuf[k + PA]]], 0, 1);
+                rng[k] = lrng[okey[pbuf[k]]];
             }
         }
 
-        // Phase 2: probe lineitem CSR for each passing order with a software
-        // prefetch pipeline. The CSR boundary arrays (ls/le) and lineitem date
-        // columns are large and accessed at data-dependent offsets, so we issue
-        // prefetches well ahead of use to hide DRAM latency.
+        // Phase 2b: probe lineitem dates. Prefetch addresses come straight from
+        // the compact range array (no dependent load), maximizing MLP.
         {
             PROFILE_SCOPE("q4_orders_scan_agg");
-            const int n = (int)npass;
-            const int PF1 = 96;  // prefetch CSR boundaries this far ahead
-            const int PF2 = 48;  // prefetch lineitem dates this far ahead
+            const int PB = 128;
             for (int k = 0; k < n; k++) {
-                if (k + PF1 < n) {
-                    int32_t fok = okey[pbuf[k + PF1]];
-                    __builtin_prefetch(&lrng[fok], 0, 1);
+                if (k + PB < n) {
+                    int32_t s2 = rng[k + PB].start;
+                    __builtin_prefetch(&lc[s2], 0, 1);
+                    __builtin_prefetch(&lr[s2], 0, 1);
                 }
-                if (k + PF2 < n) {
-                    int32_t mok = okey[pbuf[k + PF2]];
-                    int32_t ms = lrng[mok].start;
-                    __builtin_prefetch(&lc[ms], 0, 1);
-                    __builtin_prefetch(&lr[ms], 0, 1);
-                }
-                int32_t row = pbuf[k];
-                int32_t ok = okey[row];
-                int32_t start = lrng[ok].start;
-                int32_t end = lrng[ok].end;
+                Database::LineitemRange r = rng[k];
                 bool late = false;
-                for (int32_t j = start; j < end; j++) {
+                for (int32_t j = r.start; j < r.end; j++) {
                     TRACE_INC(li_probed);
                     if (lc[j] < lr[j]) { late = true; break; }
                 }
                 if (late) {
                     TRACE_INC(orders_emitted);
-                    const std::string& p = db->o_orderpriority[row];
+                    const std::string& p = db->o_orderpriority[pbuf[k]];
                     int b = (int)((unsigned char)p[0] - '1');
                     cnt[b]++;
                     if (!repr[b]) repr[b] = &p;
