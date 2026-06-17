@@ -234,9 +234,12 @@ Database* build(ParquetTables* pt) {
     // Build orderkey->index map
     db->max_orderkey = *std::max_element(db->o_orderkey.begin(), db->o_orderkey.end());
     db->orderkey_to_idx.assign(db->max_orderkey + 1, -1);
+    bool ord_sorted = true;
     for (int32_t i = 0; i < db->n_orders; i++) {
         db->orderkey_to_idx[db->o_orderkey[i]] = i;
+        if (i > 0 && db->o_orderkey[i] < db->o_orderkey[i-1]) ord_sorted = false;
     }
+    db->orders_sorted_by_orderkey = ord_sorted;
 
     // Build orderkey CSR index for lineitem
     db->lineitem_sorted_by_orderkey = true;

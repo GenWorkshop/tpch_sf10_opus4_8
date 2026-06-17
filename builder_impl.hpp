@@ -84,6 +84,7 @@ struct Database {
     // Derived: orderkey → row index (direct map for dense orderkeys)
     std::vector<int32_t> orderkey_to_idx;  // indexed by orderkey
     int32_t max_orderkey;
+    bool orders_sorted_by_orderkey = false;
 
     // ---- LINEITEM ----
     int64_t n_lineitem;
