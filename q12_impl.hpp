@@ -52,6 +52,9 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
         // are ascending but sparse, so software-prefetch the scattered columns a
         // fixed distance ahead to hide the cache-miss latency.
         constexpr int64_t PF = 48;
+        constexpr int64_t PF2 = 16;
+        const int32_t* __restrict ok2idx = db->orderkey_to_idx.data();
+        const int32_t max_ok = db->max_orderkey;
         for (int64_t s = 0; s < count; s++) {
             if (s + PF < count) {
                 const int32_t j = survivors[s + PF];
@@ -59,6 +62,13 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
                 __builtin_prefetch(&shipdate[j], 0, 1);
                 __builtin_prefetch(&shipmode[j], 0, 1);
                 __builtin_prefetch(&orderkey[j], 0, 1);
+            }
+            if (s + PF2 < count) {
+                // orderkey[] for this index is already in cache (prefetched at PF);
+                // chase one level into orderkey_to_idx to hide its miss latency.
+                const int32_t j = survivors[s + PF2];
+                const int32_t ok = orderkey[j];
+                if (ok >= 0 && ok <= max_ok) __builtin_prefetch(&ok2idx[ok], 0, 1);
             }
             const int32_t i = survivors[s];
             const Date rd = receiptdate[i];
@@ -79,8 +89,8 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
 
             // Get order priority (perfect-hash probe into orders)
             int32_t ok = orderkey[i];
-            if (ok > db->max_orderkey) continue;
-            int32_t o_idx = db->orderkey_to_idx[ok];
+            if (ok > max_ok) continue;
+            int32_t o_idx = ok2idx[ok];
             if (o_idx < 0) continue;
 
             TRACE_INC(li_emitted);
