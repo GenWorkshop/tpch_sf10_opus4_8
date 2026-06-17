@@ -12,13 +12,9 @@
     "q9",
     "q10",
     "q11",
-    "q12"
+    "q12",
+    "q13"
   ],
-  "current_query": "q13",
-  "completed_stages": [
-    "sample_plan",
-    "trace",
-    "expert_knowledge",
-    "human_reference"
-  ]
+  "current_query": "q14",
+  "completed_stages": []
 }
