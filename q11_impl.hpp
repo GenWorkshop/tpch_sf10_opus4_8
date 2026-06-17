@@ -3,40 +3,48 @@
 #include "query_utils.hpp"
 #include <ostream>
 #include <vector>
-#include <unordered_set>
-#include <unordered_map>
 #include <algorithm>
 
 inline void run_q11_impl(Database* db, std::ostream& out) {
     PROFILE_SCOPE("q11_total");
     TRACE_DECL_COUNTER(ps_scanned);
     TRACE_DECL_COUNTER(ps_emitted);
-    // n_name = 'RUSSIA' → nationkey
+    // n_name = 'RUSSIA' -> nationkey
     int32_t russia_nk = db->nation_name_to_key["RUSSIA"];
 
-    // Suppliers in RUSSIA
-    std::unordered_set<int32_t> russia_suppkeys; // 1-based suppkeys
+    // Dense membership bitmap: suppkey (1-based) -> in RUSSIA?
+    std::vector<uint8_t> supp_in_russia(db->n_supplier + 1, 0);
     for (int32_t i = 0; i < db->n_supplier; i++) {
         if (db->s_nationkey[i] == russia_nk) {
-            russia_suppkeys.insert(i + 1);
+            supp_in_russia[i + 1] = 1;
         }
     }
 
-    // Scan partsupp, filter by RUSSIA suppliers
-    // Group by ps_partkey → sum(ps_supplycost * ps_availqty)
-    // ps_supplycost is scale 2 (cents), ps_availqty is integer
-    // product = supplycost * availqty → scale 2
-    std::unordered_map<int32_t, __int128> partkey_value;
+    // Dense per-partkey accumulator (partkey is 1-based dense).
+    // product = ps_supplycost(scale 2) * ps_availqty(int) -> scale 2.
+    std::vector<__int128> partkey_value(db->n_part + 1, 0);
+    std::vector<int32_t> touched;
+    touched.reserve(db->n_partsupp / 20 + 16);
     __int128 total_value = 0;
 
     {
         PROFILE_SCOPE("q11_partsupp_scan_agg");
-        for (int32_t i = 0; i < db->n_partsupp; i++) {
+        const int32_t* __restrict ps_suppkey = db->ps_suppkey.data();
+        const int32_t* __restrict ps_partkey = db->ps_partkey.data();
+        const int32_t* __restrict ps_availqty = db->ps_availqty.data();
+        const int64_t* __restrict ps_supplycost = db->ps_supplycost.data();
+        const uint8_t* __restrict mem = supp_in_russia.data();
+        __int128* __restrict acc = partkey_value.data();
+        const int32_t n = db->n_partsupp;
+        for (int32_t i = 0; i < n; i++) {
             TRACE_INC(ps_scanned);
-            if (russia_suppkeys.count(db->ps_suppkey[i])) {
+            if (mem[ps_suppkey[i]]) {
                 TRACE_INC(ps_emitted);
-                __int128 val = (__int128)db->ps_supplycost[i] * db->ps_availqty[i];
-                partkey_value[db->ps_partkey[i]] += val;
+                __int128 val = (__int128)ps_supplycost[i] * ps_availqty[i];
+                int32_t pk = ps_partkey[i];
+                __int128 prev = acc[pk];
+                if (prev == 0) touched.push_back(pk);
+                acc[pk] = prev + val;
                 total_value += val;
             }
         }
@@ -44,21 +52,18 @@ inline void run_q11_impl(Database* db, std::ostream& out) {
     TRACE_COUNT("q11_rows_scanned", ps_scanned);
     TRACE_COUNT("q11_rows_emitted", ps_emitted);
     TRACE_COUNT("q11_agg_rows_in", ps_emitted);
-    TRACE_COUNT("q11_groups_created", (uint64_t)partkey_value.size());
+    TRACE_COUNT("q11_groups_created", (uint64_t)touched.size());
 
-    // HAVING threshold: total_value * 0.0001
-    // To avoid floating point: threshold = total_value / 10000
-    // But we need > not >=, so: value > total_value * 0.0001
-    double threshold = (double)total_value * 0.0001;
-
-    // Collect results that pass HAVING
+    // HAVING: value > total_value * 0.0001  <=>  value * 10000 > total_value
     struct ResultRow {
         int32_t ps_partkey;
         long long value;
     };
     std::vector<ResultRow> results;
-    for (auto& [pk, val] : partkey_value) {
-        if ((double)val > threshold) {
+    results.reserve(touched.size());
+    for (int32_t pk : touched) {
+        __int128 val = partkey_value[pk];
+        if (val * 10000 > total_value) {
             results.push_back({pk, static_cast<long long>(val)});
         }
     }
