@@ -71,11 +71,11 @@ inline void run_q10_impl(Database* db, std::ostream& out) {
         uint32_t len;
     };
     std::vector<Rec> recs;
+    std::vector<int32_t> qual;
     {
-        size_t est = 0;
         for (int32_t ck = 1; ck <= db->n_customer; ck++)
-            if (cust_revenue[ck] != 0) est++;
-        recs.reserve(est);
+            if (cust_revenue[ck] != 0) qual.push_back(ck);
+        recs.reserve(qual.size());
     }
 
     std::string frag;
@@ -127,10 +127,25 @@ inline void run_q10_impl(Database* db, std::ostream& out) {
         frag.push_back('"');
     };
 
-    // Pass 1: sequential over customers, serialize qualifying rows.
-    for (int32_t ck = 1; ck <= db->n_customer; ck++) {
+    // Pass 1: serialize qualifying rows (custkey order) with two-level prefetch.
+    const size_t nq = qual.size();
+    const int P1_FAR = 32;
+    const int P1_NEAR = 12;
+    for (size_t qi = 0; qi < nq; qi++) {
+        if (qi + P1_FAR < nq) {
+            int32_t fi = qual[qi + P1_FAR] - 1;
+            __builtin_prefetch(&db->c_name[fi]);
+            __builtin_prefetch(&db->c_address[fi]);
+            __builtin_prefetch(&db->c_comment[fi]);
+        }
+        if (qi + P1_NEAR < nq) {
+            int32_t ni = qual[qi + P1_NEAR] - 1;
+            __builtin_prefetch(db->c_name[ni].data());
+            __builtin_prefetch(db->c_address[ni].data());
+            __builtin_prefetch(db->c_comment[ni].data());
+        }
+        int32_t ck = qual[qi];
         int64_t rev = cust_revenue[ck];
-        if (rev == 0) continue;
         int32_t c_idx = ck - 1;
         int32_t nk = db->c_nationkey[c_idx];
         uint32_t off = (uint32_t)frag.size();
