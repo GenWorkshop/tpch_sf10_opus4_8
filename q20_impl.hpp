@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <algorithm>
+#include <cstring>
 
 inline void run_q20_impl(Database* db, std::ostream& out) {
     PROFILE_SCOPE("q20_total");
@@ -16,29 +17,42 @@ inline void run_q20_impl(Database* db, std::ostream& out) {
     // n_name = 'FRANCE' → nationkey
     int32_t france_nk = db->nation_name_to_key["FRANCE"];
 
-    // Parts where p_name like 'linen%'
-    std::unordered_set<int32_t> linen_parts; // partkeys (1-based)
-    for (int32_t i = 0; i < db->n_part; i++) {
-        if (db->p_name[i].size() >= 5 && db->p_name[i].substr(0, 5) == "linen") {
-            linen_parts.insert(i + 1);
+    // Parts where p_name like 'linen%' → cache-resident bitmap indexed by partkey (1-based)
+    const int32_t n_part = db->n_part;
+    std::vector<uint64_t> linen_bits((size_t)(n_part + 1) / 64 + 1, 0);
+    for (int32_t i = 0; i < n_part; i++) {
+        const std::string& nm = db->p_name[i];
+        if (nm.size() >= 5 && std::memcmp(nm.data(), "linen", 5) == 0) {
+            int32_t pk = i + 1;
+            linen_bits[(uint32_t)pk >> 6] |= (1ULL << ((uint32_t)pk & 63));
         }
     }
+    auto is_linen = [&](int32_t pk) -> bool {
+        return (linen_bits[(uint32_t)pk >> 6] >> ((uint32_t)pk & 63)) & 1ULL;
+    };
 
     // Compute sum(l_quantity) per (partkey, suppkey) for shipdate in 1997
     const Date date_lo = date_to_epoch(1997, 1, 1);
     const Date date_hi = date_to_epoch(1998, 1, 1);
 
     std::unordered_map<int64_t, int64_t> ps_qty_sum; // key = partkey*1000000 + suppkey → sum qty (scale 2)
+    ps_qty_sum.reserve(1 << 17);
     {
         PROFILE_SCOPE("q20_lineitem_scan_agg");
-        for (int64_t i = 0; i < db->n_lineitem; i++) {
+        const Date* __restrict shipdate = db->l_shipdate.data();
+        const int32_t* __restrict lpartkey = db->l_partkey.data();
+        const int32_t* __restrict lsuppkey = db->l_suppkey.data();
+        const int64_t* __restrict lqty = db->l_quantity.data();
+        const int64_t n = db->n_lineitem;
+        for (int64_t i = 0; i < n; i++) {
             TRACE_INC(li_scanned);
-            if (db->l_shipdate[i] >= date_lo && db->l_shipdate[i] < date_hi) {
-                int32_t pk = db->l_partkey[i];
-                if (linen_parts.count(pk)) {
+            Date d = shipdate[i];
+            if (d >= date_lo && d < date_hi) {
+                int32_t pk = lpartkey[i];
+                if (is_linen(pk)) {
                     TRACE_INC(li_emitted);
-                    int64_t key = (int64_t)pk * 1000000LL + db->l_suppkey[i];
-                    ps_qty_sum[key] += db->l_quantity[i];
+                    int64_t key = (int64_t)pk * 1000000LL + lsuppkey[i];
+                    ps_qty_sum[key] += lqty[i];
                 }
             }
         }
@@ -55,7 +69,7 @@ inline void run_q20_impl(Database* db, std::ostream& out) {
         for (int32_t i = 0; i < db->n_partsupp; i++) {
             TRACE_INC(ps_scanned);
             int32_t pk = db->ps_partkey[i];
-            if (!linen_parts.count(pk)) continue;
+            if (!is_linen(pk)) continue;
 
             int64_t key = (int64_t)pk * 1000000LL + db->ps_suppkey[i];
             auto it = ps_qty_sum.find(key);
