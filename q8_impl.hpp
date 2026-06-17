@@ -80,7 +80,13 @@ inline void run_q8_impl(Database* db, std::ostream& out) {
     const uint8_t* __restrict ca = cust_america.data();
     uint8_t* __restrict ov = ord_valid.data();
     uint8_t* __restrict oyr = ord_year.data();
-    for (int32_t i = 0; i < db->n_orders; i++) {
+    constexpr int32_t OPD = 96;
+    const int32_t no = db->n_orders;
+    for (int32_t i = 0; i < no; i++) {
+        if (i + OPD < no) {
+            uint32_t cf = (uint32_t)(ock[i + OPD] - 1);
+            __builtin_prefetch(&ca[cf >> 3], 0, 0);
+        }
         Date od = ood[i];
         if (od >= date_lo && od <= date_hi) {
             uint32_t c_idx = (uint32_t)(ock[i] - 1);
@@ -112,12 +118,12 @@ inline void run_q8_impl(Database* db, std::ostream& out) {
 
     {
         PROFILE_SCOPE("q8_lineitem_scan_join_agg");
-        constexpr int64_t PD = 64;
+        constexpr int64_t PD = 128;
         for (int64_t i = 0; i < n; i++) {
             TRACE_INC(li_scanned);
             if (i + PD < n) {
                 int32_t pkf = lp[i + PD];
-                __builtin_prefetch(&pm[(uint32_t)pkf >> 3], 0, 0);
+                __builtin_prefetch(&pm[(uint32_t)pkf >> 3], 0, 3);
             }
             int32_t pk = lp[i];
             if (!((pm[pk >> 3] >> (pk & 7)) & 1)) continue;
