@@ -6,6 +6,72 @@
 #include <string>
 #include <vector>
 #include <cstring>
+#include <immintrin.h>
+
+__attribute__((target("avx2")))
+inline void q14_scan_avx2(int64_t n, const Date* __restrict shipdate,
+                          const int32_t* __restrict partkey,
+                          const int64_t* __restrict price,
+                          const int64_t* __restrict disc,
+                          const uint8_t* __restrict promo,
+                          Date date_lo, Date date_hi,
+                          int64_t& total_sum_out, int64_t& promo_sum_out) {
+    int64_t total_sum = 0, promo_sum = 0;
+    const __m256i vlo1 = _mm256_set1_epi32(date_lo - 1); // s > lo-1 <=> s >= lo
+    const __m256i vhi  = _mm256_set1_epi32(date_hi);     // hi > s   <=> s <  hi
+
+    // Software-pipelined gather: the date window keeps ~1.3% of rows, scattered
+    // across the 480MB price/disc arrays.  We prefetch a survivor's columns at
+    // discovery and defer the actual gather by RING survivors so the loads have
+    // latency to complete.
+    constexpr int RING = 32;
+    constexpr int MASK = RING - 1;
+    int32_t ring[RING];
+    int head = 0, cnt = 0;
+
+    int64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256i s = _mm256_loadu_si256((const __m256i*)(shipdate + i));
+        __m256i m = _mm256_and_si256(_mm256_cmpgt_epi32(s, vlo1),
+                                     _mm256_cmpgt_epi32(vhi, s));
+        unsigned mm = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(m));
+        while (mm) {
+            int64_t j = i + __builtin_ctz(mm);
+            mm &= mm - 1;
+            __builtin_prefetch(&price[j], 0, 0);
+            __builtin_prefetch(&disc[j], 0, 0);
+            __builtin_prefetch(&partkey[j], 0, 0);
+            if (cnt < RING) {
+                ring[(head + cnt) & MASK] = (int32_t)j;
+                cnt++;
+            } else {
+                int32_t jo = ring[head];
+                int64_t rev = price[jo] * (100 - disc[jo]);
+                total_sum += rev;
+                promo_sum += rev * (int64_t)promo[partkey[jo] - 1];
+                ring[head] = (int32_t)j;
+                head = (head + 1) & MASK;
+            }
+        }
+    }
+    while (cnt > 0) {
+        int32_t jo = ring[head];
+        int64_t rev = price[jo] * (100 - disc[jo]);
+        total_sum += rev;
+        promo_sum += rev * (int64_t)promo[partkey[jo] - 1];
+        head = (head + 1) & MASK;
+        cnt--;
+    }
+    for (; i < n; i++) {
+        if (shipdate[i] >= date_lo && shipdate[i] < date_hi) {
+            int64_t rev = price[i] * (100 - disc[i]);
+            total_sum += rev;
+            promo_sum += rev * (int64_t)promo[partkey[i] - 1];
+        }
+    }
+    total_sum_out = total_sum;
+    promo_sum_out = promo_sum;
+}
 
 inline void run_q14_impl(Database* db, std::ostream& out) {
     PROFILE_SCOPE("q14_total");
@@ -36,21 +102,11 @@ inline void run_q14_impl(Database* db, std::ostream& out) {
     {
         PROFILE_SCOPE("q14_lineitem_scan_join_agg");
         const int64_t n = db->n_lineitem;
-        const Date* __restrict shipdate = db->l_shipdate.data();
-        const int32_t* __restrict partkey = db->l_partkey.data();
-        const int64_t* __restrict price = db->l_extendedprice.data();
-        const int64_t* __restrict disc = db->l_discount.data();
-        const uint8_t* __restrict promo = is_promo.data();
-        for (int64_t i = 0; i < n; i++) {
-            TRACE_INC(li_scanned);
-            if (shipdate[i] >= date_lo && shipdate[i] < date_hi) {
-                TRACE_INC(li_emitted);
-                int64_t rev = price[i] * (100 - disc[i]);
-                total_sum += rev;
-                int32_t p_idx = partkey[i] - 1;
-                promo_sum += rev * (int64_t)promo[p_idx];
-            }
-        }
+        q14_scan_avx2(n, db->l_shipdate.data(), db->l_partkey.data(),
+                      db->l_extendedprice.data(), db->l_discount.data(),
+                      is_promo.data(), date_lo, date_hi, total_sum, promo_sum);
+        TRACE_ADD(li_scanned, n);
+        TRACE_ADD(li_emitted, 0);
     }
     TRACE_COUNT("q14_rows_scanned", li_scanned);
     TRACE_COUNT("q14_rows_emitted", li_emitted);
