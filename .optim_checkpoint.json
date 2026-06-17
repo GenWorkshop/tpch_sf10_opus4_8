@@ -9,5 +9,9 @@
     "q6"
   ],
   "current_query": "q7",
-  "completed_stages": []
+  "completed_stages": [
+    "sample_plan",
+    "trace",
+    "expert_knowledge"
+  ]
 }
