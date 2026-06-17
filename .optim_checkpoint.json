@@ -18,5 +18,7 @@
     "q15"
   ],
   "current_query": "q16",
-  "completed_stages": []
+  "completed_stages": [
+    "sample_plan"
+  ]
 }
