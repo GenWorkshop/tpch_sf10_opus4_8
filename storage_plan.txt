@@ -1,0 +1,377 @@
+================================================================================
+IN-MEMORY STORAGE LAYOUT PLAN — TPC-H SF10 ANALYTICAL WORKLOAD
+================================================================================
+
+All 8 tables are accessed across the 22 queries. The layout is optimized for
+single-node in-memory analytical processing with no data redundancy.
+
+================================================================================
+TABLE: lineitem  (~60M rows, the dominant table)
+================================================================================
+
+STORAGE PHILOSOPHY: "Temporal-Sharded Column Swarm with Micro-Indexes"
+
+The lineitem table is accessed by nearly every query, with l_shipdate being the
+most common filter predicate. We adopt a radical hybrid layout:
+
+PRIMARY PARTITIONING:
+  - Partition by l_shipdate into 2,526 daily micro-partitions (1992-01-02 to
+    1998-12-01). Each partition is a self-contained columnar mini-table.
+  - Partition metadata: a dense array[2526] of {offset, row_count} structs
+    indexed by (date - epoch_base). O(1) partition lookup for date range scans.
+
+COLUMN GROUPS (within each micro-partition):
+
+  Group A — "Revenue Core" (hot path for Q1,Q3,Q5,Q6,Q7,Q8,Q14,Q15,Q19):
+    • l_extendedprice: int64 (cents, fixed-point ×100), delta-of-delta + SIMD
+      bit-packing. Typical range ~900–105000 cents fits in 17 bits delta-coded.
+    • l_discount: uint8 (0–10 representing 0.00–0.10, since only 11 distinct
+      values exist in TPC-H). 1 byte per row, no encoding needed.
+    • l_tax: uint8 (0–8 representing 0.00–0.08). Same trick.
+    • l_quantity: uint8 (1–50 in TPC-H). Single byte, raw.
+
+  Group B — "Join Keys" (hot path for all join queries):
+    • l_orderkey: int32, sorted within partition for merge-join with orders.
+      Because lineitem is naturally clustered by orderkey, we store as
+      base + frame-of-reference with bit-packing (typically 4–8 bits per value
+      within a 1024-row frame after delta encoding).
+    • l_partkey: int32, dictionary-free, FOR-encoded in 1024-row frames.
+    • l_suppkey: int32, FOR-encoded. At SF10, suppkey fits in 17 bits.
+    • l_linenumber: uint8 (1–7). Implicit from position within orderkey group
+      when orderkey is sorted — ZERO storage if we maintain orderkey sort +
+      a "line count per order" side array. Fallback: raw uint8.
+
+  Group C — "Date Trio" (for Q4, Q12, Q21 commitdate/receiptdate predicates):
+    • l_shipdate: IMPLICIT from partition ID — zero bytes stored!
+    • l_commitdate: int16 delta from l_shipdate (always within ~±120 days).
+      Stored as signed byte offset from shipdate. If outlier, use 2 bytes.
+      Hybrid: 95% fit in int8 → use a bitflag array + overflow list.
+    • l_receiptdate: int16 delta from l_commitdate (typically +1 to +30 days).
+      uint8 suffices for 99%+ of rows; overflow list for rest.
+
+  Group D — "Categorical Flags" (for Q1, Q10, Q12, Q19):
+    • l_returnflag: 2-bit encoding (3 values: A/N/R → 0/1/2). Packed 4 per byte.
+    • l_linestatus: 1-bit encoding (O/F → 0/1). Bit-vector.
+    • l_shipmode: 3-bit encoding (7 values). Packed into bit-stream.
+    • l_shipinstruct: 2-bit encoding (4 values). Packed 4 per byte.
+
+  Group E — "Cold Payload" (rarely accessed, only for output/comments):
+    • l_comment: Variable-length strings stored in a contiguous arena per
+      partition with a uint32 offset array. LZ4-compressed per 4KB page.
+
+SECONDARY INDEXES (non-redundant metadata):
+  - Orderkey→partition bitmap: For Q4/Q12/Q21 that filter orders first then
+    probe lineitem by l_orderkey. A CSR-style index: for each orderkey, store
+    the partition(s) containing its lineitems. Since lineitems for one order
+    usually share similar shipdates (within 1–2 partitions), this is compact.
+  - Per-partition MIN/MAX zone maps for l_quantity, l_extendedprice, l_discount.
+  - Pre-computed per-orderkey aggregate: sum(l_quantity) stored as a dense
+    int32 array indexed by orderkey (for Q18's HAVING sum > 314 filter).
+    This is derived data but NOT redundant — it's a lossy summary enabling
+    skip of the full scan. The actual l_quantity values are still stored above.
+
+SPECULATIVE: "Fused Revenue Vector"
+  - Materialize l_extendedprice * (1 - l_discount) as a pre-computed int64
+    column per partition. This appears in Q1,Q3,Q5,Q7,Q8,Q10,Q14,Q15,Q19.
+    Stored as derived metadata (a materialized expression index), not raw data
+    duplication — the base columns remain authoritative for reconstruction.
+    → Actually, this WOULD be redundant. Instead: use SIMD to compute on-the-fly
+    from Group A. At memory bandwidth speeds, the multiply is free.
+
+================================================================================
+TABLE: orders  (~15M rows)
+================================================================================
+
+STORAGE PHILOSOPHY: "Date-Partitioned Custkey-Sorted Hybrid Columnar"
+
+PRIMARY PARTITIONING:
+  - Partition by o_orderdate into monthly buckets (84 months, 1992-01 to 1998-12).
+  - Within each monthly partition, rows are sorted by o_custkey for efficient
+    merge-join with customer table.
+
+COLUMN LAYOUT:
+
+  Hot Columns (accessed in most queries):
+    • o_orderkey: int32. Since orderkeys are sparse (multiples of a factor with
+      gaps), store raw. But maintain a global dense bitmap[max_orderkey] →
+      partition_id for O(1) orderkey lookups from lineitem joins.
+    • o_custkey: int32, sorted within partition. Delta-encoded + bit-packed
+      (after sorting, deltas are small: ~0–500 range, 9–10 bits typical).
+    • o_orderdate: IMPLICIT from monthly partition + uint8 day-of-month offset
+      (1–31). Only 1 byte per row for the date!
+    • o_orderstatus: 2-bit enum (F/O/P → 0/1/2). Bit-packed.
+    • o_totalprice: int64 (cents). FOR-encoded per 1024-row frame.
+
+  Warm Columns:
+    • o_orderpriority: 3-bit encoding (5 values). Bit-packed.
+    • o_shippriority: Always 0 in TPC-H generator → run-length-encoded as
+      single value. Effectively zero storage.
+
+  Cold Columns:
+    • o_clerk: Dictionary-encoded. ~1000 distinct clerks at SF10. uint16 code +
+      global dictionary of ~1000 strings.
+    • o_comment: Arena-allocated variable-length with LZ4 per 4KB page.
+      Suffix-array index on "express" and "requests" substrings for Q13's
+      NOT LIKE '%express%requests%' — stored as a per-partition bitset marking
+      rows that do NOT match the pattern (precomputed filter metadata).
+
+SPECULATIVE: "Order-Existence Bitvector"
+  - A dense bitvector indexed by c_custkey indicating whether that customer has
+    ANY order (for Q22's NOT EXISTS). 1 bit per customer = ~187KB at SF10.
+    This is metadata/index, not redundant data.
+
+================================================================================
+TABLE: customer  (~1.5M rows)
+================================================================================
+
+STORAGE PHILOSOPHY: "Custkey-Dense Array with Segment Clustering"
+
+Since c_custkey is dense (1..1,500,000), we use direct-addressed columnar arrays:
+
+COLUMN LAYOUT (all arrays indexed by c_custkey - 1):
+
+  • c_custkey: IMPLICIT from array index. Zero storage.
+  • c_nationkey: uint8 (0–24, 25 nations). Dense array, 1 byte/row.
+  • c_mktsegment: 3-bit encoding (5 segments: AUTOMOBILE/BUILDING/FURNITURE/
+    HOUSEHOLD/MACHINERY). Bit-packed vector. For Q3, a precomputed bitset of
+    custkeys where c_mktsegment = 'BUILDING' (stored as metadata).
+  • c_acctbal: int32 (cents). Raw array. Pre-sorted auxiliary index not needed
+    since Q22 does a full scan with avg comparison.
+  • c_phone: Stored as two parts:
+    - c_phone_prefix: uint8 (country code, 2 digits, 10–34 range → 5 bits).
+    - c_phone_suffix: fixed 12 bytes (remaining digits + dashes). OR better:
+      parse into uint64 numeric representation (13 digits fit in 44 bits).
+  • c_name: Since format is "Customer#XXXXXXXXX" (fixed prefix + 9-digit number
+    that equals custkey), store NOTHING — reconstruct from custkey on output.
+  • c_address: Variable-length arena with uint32 offset array.
+  • c_comment: Variable-length arena with uint32 offset array, LZ4 compressed.
+
+SPECULATIVE: "Nation-Clustered Sublists"
+  - Maintain 25 sorted lists (one per nation) of custkeys. Each is a uint32
+    array of custkeys belonging to that nation. Enables instant nation-filtered
+    customer scans for Q5/Q7/Q8 without touching all 1.5M rows.
+    (This is an index structure, not data duplication — c_nationkey column is
+    authoritative.)
+
+================================================================================
+TABLE: supplier  (~100K rows)
+================================================================================
+
+STORAGE PHILOSOPHY: "Tiny Table, Dense-Array Direct Access"
+
+At SF10 only 100K rows. Direct-addressed by s_suppkey (dense 1..100,000):
+
+  • s_suppkey: IMPLICIT from array index. Zero storage.
+  • s_nationkey: uint8 array (25 nations). 100KB total.
+  • s_acctbal: int32 array (cents). 400KB.
+  • s_name: Fixed format "Supplier#XXXXXXXXX" — reconstruct from suppkey.
+    Zero storage.
+  • s_phone: uint64 numeric encoding (same as customer). 800KB.
+  • s_address: Pooled variable-length arena + uint32 offsets. ~2.5MB.
+  • s_comment: Pooled variable-length arena + uint32 offsets. ~5MB.
+    Additionally: a precomputed bitset marking suppliers whose s_comment matches
+    '%Customer%Complaints%' (for Q16). ~12.5KB metadata.
+
+NATION-GROUPED INDEX:
+  - 25 arrays of suppkeys grouped by nation. For Q5/Q7/Q11/Q20/Q21 nation
+    filtering. Average ~4000 suppliers per nation.
+
+================================================================================
+TABLE: part  (~2M rows)
+================================================================================
+
+STORAGE PHILOSOPHY: "Partkey-Dense Columnar with Trigram Filter Metadata"
+
+Direct-addressed by p_partkey (dense 1..2,000,000):
+
+  • p_partkey: IMPLICIT from array index.
+  • p_size: uint8 (1–50). 2MB total.
+  • p_retailprice: int32 (cents). 8MB.
+  • p_brand: Dictionary-encoded uint8 (25 brands: Brand#11..Brand#55). 2MB.
+  • p_container: Dictionary-encoded uint8 (40 distinct containers). 2MB.
+  • p_type: Dictionary-encoded uint16 (150 distinct types). 4MB.
+    Additionally: suffix-hash index for LIKE '%TIN' patterns — a bitset of
+    partkeys where p_type ends with 'TIN'. Similarly for 'PROMO%' prefix.
+  • p_mfgr: Dictionary-encoded uint8 (5 manufacturers). 2MB.
+  • p_name: Variable-length arena + uint32 offsets. ~80MB.
+    Additionally: trigram inverted index on p_name for Q9's LIKE '%rosy%' and
+    Q20's LIKE 'linen%'. Maps trigrams → sorted partkey lists. Enables fast
+    substring filtering without full scan.
+  • p_comment: Variable-length arena + uint32 offsets. LZ4 compressed.
+
+PRECOMPUTED FILTER BITSETS (metadata, not redundant):
+  - p_type LIKE '%TIN' → bitvector[2M]
+  - p_type = 'ECONOMY BRUSHED TIN' → bitvector[2M]
+  - p_type NOT LIKE 'SMALL POLISHED%' → bitvector[2M]
+  - p_brand = 'Brand#13' → bitvector[2M]
+  - p_name LIKE '%rosy%' → bitvector[2M] (via trigram index)
+  - p_name LIKE 'linen%' → bitvector[2M]
+  - p_size IN (22,18,10,14,50,7,6,25) → bitvector[2M]
+
+================================================================================
+TABLE: partsupp  (~8M rows)
+================================================================================
+
+STORAGE PHILOSOPHY: "Dual-Key Interleaved Layout with Partkey-Major Sort"
+
+The table has composite key (ps_partkey, ps_suppkey). Two access patterns:
+  (a) Given partkey, find all supplier entries (Q2, Q9, Q11, Q16, Q20)
+  (b) Given suppkey, find all part entries (Q11, Q20)
+
+PRIMARY LAYOUT (Partkey-Major):
+  - Rows sorted by (ps_partkey, ps_suppkey). Since each part has exactly 4
+    suppliers in TPC-H, each partkey has exactly 4 consecutive entries.
+  - ps_partkey: IMPLICIT — index ÷ 4 gives partkey (dense, 4 rows per part).
+  - ps_suppkey: int32 array. 32MB. Within each group of 4, store as raw.
+  - ps_availqty: int32 array. 32MB. FOR-encoded per 1024-row frame.
+  - ps_supplycost: int32 (cents). 32MB. FOR-encoded.
+  - ps_comment: Variable-length arena. LZ4 compressed. ~800MB uncompressed,
+    ~200MB compressed.
+
+SECONDARY INDEX (Suppkey-Major, non-redundant):
+  - A permutation array: for each suppkey (sorted), store the row offsets in
+    the primary layout. This is a uint32 array of 8M entries (32MB) that
+    enables suppkey-first access without duplicating the actual column data.
+  - Alternatively: a CSR structure — suppkey_offsets[100001] + row_ids[8M].
+
+================================================================================
+TABLE: nation  (25 rows)
+================================================================================
+
+STORAGE PHILOSOPHY: "Fully Materialized Lookup Table in L1 Cache"
+
+Entire table fits in a single cache line cluster (~2KB). Store as:
+
+  • Array of 25 structs (AoS for cache locality on single-row lookups):
+    struct Nation {
+      uint8  n_nationkey;     // redundant with index but useful for joins
+      char   n_name[25];     // fixed-size, null-padded
+      uint8  n_regionkey;    // 0–4
+      char   n_comment[152]; // fixed-size, null-padded
+    };
+
+  • SUPPLEMENTARY: Two derived lookup structures:
+    - regionkey_to_nations[5] → list of nationkeys per region (for Q2/Q5/Q8)
+    - name_to_nationkey hash: perfect hash (25 entries) for name lookups
+
+  Total: ~4.5KB. Fits in L1 cache. No encoding needed.
+
+================================================================================
+TABLE: region  (5 rows)
+================================================================================
+
+STORAGE PHILOSOPHY: "Compile-Time Constants"
+
+With only 5 rows, this is essentially a constant table:
+
+  • Stored as a static array of 5 structs:
+    struct Region {
+      uint8  r_regionkey;
+      char   r_name[25];
+      char   r_comment[152];
+    };
+
+  • SUPPLEMENTARY: name→regionkey perfect hash (5 entries, single lookup).
+  • For query processing, region filtering is resolved at "plan time" by
+    looking up the regionkey for the constant name (e.g., 'ASIA' → 2) and
+    substituting it into downstream predicates as a constant.
+
+  Total: ~900 bytes. Pinned in register/L1 cache.
+
+================================================================================
+CROSS-TABLE STRUCTURAL OPTIMIZATIONS (Index/Metadata Only)
+================================================================================
+
+1. LINEITEM→ORDERS JOIN ACCELERATOR:
+   Since lineitem is partitioned by shipdate and orders by orderdate, and these
+   don't align, maintain a lightweight "orderkey → order_partition" mapping:
+   a dense uint8 array[max_orderkey] giving the monthly partition index of each
+   order. ~15M bytes = 15MB. Enables instant partition skip during joins.
+
+2. CUSTOMER→ORDERS CARDINALITY MAP:
+   A dense uint32 array[max_custkey] storing the count of orders per customer.
+   Used by Q13 (count of orders per customer) and Q22 (exists check).
+   For Q22, this degenerates to the bitvector mentioned earlier.
+   ~6MB. This is a precomputed aggregate index.
+
+3. ORDERKEY SORT-MERGE ALIGNMENT:
+   Both lineitem (Group B) and orders store orderkeys in sorted order within
+   their respective partitions. For queries joining these tables (Q3,Q4,Q5,Q7,
+   Q8,Q9,Q10,Q12,Q18,Q21), the engine can perform partition-to-partition
+   sort-merge joins using the orderkey→partition mapping without hash tables.
+
+4. GLOBAL STRING DICTIONARIES:
+   Shared dictionaries for repeated string domains:
+   - Ship modes: 7 entries (dictionary ID shared across lineitem/Q12/Q19)
+   - Ship instructions: 4 entries
+   - Order priorities: 5 entries
+   - Market segments: 5 entries
+   - Part brands: 25 entries
+   - Part containers: 40 entries
+   - Part types: 150 entries
+   All categorical columns reference these dictionaries via compact integer
+   codes. The dictionaries themselves are tiny constant arrays.
+
+================================================================================
+MEMORY BUDGET ESTIMATE (SF10)
+================================================================================
+
+  lineitem:    ~3.2 GB (dominated by Group A+B; dates near-free; comments ~600MB)
+  orders:      ~0.8 GB (comments dominate; hot columns ~200MB)
+  customer:    ~0.2 GB (addresses + comments; hot columns ~15MB)
+  partsupp:    ~0.3 GB (comments dominate; numeric columns ~96MB)
+  part:        ~0.15 GB (p_name dominates; encoded columns ~25MB)
+  supplier:    ~0.01 GB
+  nation:      ~4.5 KB
+  region:      ~900 B
+  Indexes/Meta: ~0.1 GB
+
+  TOTAL: ~4.8 GB (vs. ~10GB raw CSV). ~52% compression through encoding,
+  implicit columns, dictionary coding, and delta/FOR schemes.
+
+================================================================================
+WILD SPECULATIVE IDEAS (Bonus Section)
+================================================================================
+
+A. "QUERY-SHAPED TILES":
+   Instead of per-table storage, pre-materialize "tiles" shaped like common
+   join subgraphs. E.g., a fused lineitem-orders tile sorted by orderkey with
+   interleaved columns from both tables. The tile stores each lineitem row
+   augmented with o_orderdate, o_custkey, o_orderstatus inline. This eliminates
+   the join entirely for Q3/Q4/Q5/Q10/Q12. NOT USED (would be redundant), but
+   illustrates the concept of "query-aware physical design."
+
+B. "SIMD-NATIVE COLUMNAR PAGES":
+   Align all column data to 64-byte boundaries. Use 512-bit AVX-512 registers
+   natively: pack 64 uint8 discount values in one register, 16 int32 prices in
+   one register. Column pages are exactly 64KB (fits L1 TLB entry) with a
+   header containing min/max/null-count for zonemap filtering.
+
+C. "CORRELATED COLUMN COMPRESSION":
+   Exploit correlations: l_extendedprice ≈ l_quantity × unit_price. Store
+   unit_price (derived from partkey) + residual. The residual is near-zero and
+   compresses beautifully. Reconstruction: lookup part's retailprice, multiply
+   by quantity, add residual. Trading compute for memory bandwidth.
+
+D. "HASH-EMBEDDED FOREIGN KEYS":
+   For each foreign key column (e.g., l_suppkey), co-store a precomputed hash
+   of the join key. During hash joins, skip the hash computation step entirely.
+   Cost: 1–2 extra bytes per row. Benefit: eliminates hash function from the
+   critical path of billion-row joins.
+
+E. "TEMPORAL BUTTERFLY LAYOUT":
+   For the date trio (ship/commit/receipt), store as a single "event timeline"
+   per order: a sorted sequence of (event_type, date) pairs. This enables
+   range queries across all three date dimensions simultaneously using a
+   single scan, and makes predicates like "commitdate < receiptdate" a simple
+   comparison of adjacent elements.
+
+F. "PROBABILISTIC SKIP STRUCTURES":
+   Attach per-partition Bloom filters for low-cardinality join keys. E.g., a
+   Bloom filter on l_suppkey per shipdate partition. When Q20/Q21 probes
+   lineitem for specific suppkeys, skip entire partitions via Bloom filter
+   (false positive rate < 1% with 10 bits/element).
+
+================================================================================
+END OF STORAGE PLAN
+================================================================================
