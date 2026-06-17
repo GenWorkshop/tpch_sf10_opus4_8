@@ -82,7 +82,7 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
     const Date* __restrict receiptdate = db->l_receiptdate.data();
     const Date* __restrict shipdate    = db->l_shipdate.data();
     const int32_t* __restrict orderkey = db->l_orderkey.data();
-    const std::string* __restrict shipmode = db->l_shipmode.data();
+    const uint8_t* __restrict shipmode = db->l_shipmode_code.data();
 
     {
         PROFILE_SCOPE("q12_lineitem_scan_join_agg");
@@ -108,7 +108,17 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
         // 2b: probe orders for the compacted (dense, ascending) orderkeys.
         const int32_t* __restrict ok2idx = db->orderkey_to_idx.data();
         const std::string* __restrict oprio = db->o_orderpriority.data();
-        const int32_t max_ok = db->max_orderkey;
+    const int32_t max_ok = db->max_orderkey;
+
+    // Dictionary-coded shipmode: precompute a per-code tag (1=MAIL, 2=FOB, 0=other)
+    // so the hot loop reads a single byte and indexes a tiny lookup table.
+    uint8_t modetag[256];
+    std::memset(modetag, 0, sizeof(modetag));
+    for (size_t d = 0; d < db->l_shipmode_dict.size(); d++) {
+        const std::string& s = db->l_shipmode_dict[d];
+        if (!s.empty() && s[0] == 'M') modetag[d] = 1;
+        else if (!s.empty() && s[0] == 'F') modetag[d] = 2;
+    }
 
         std::unique_ptr<int32_t[]> buf_ok(new int32_t[count]);
         std::unique_ptr<uint8_t[]> buf_fob(new uint8_t[count]);
@@ -122,14 +132,10 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
                     __builtin_prefetch(&orderkey[j], 0, 0);
                 }
                 const int32_t i = survivors[s];
-                // Only MAIL starts with 'M' and only FOB with 'F' among the 7
-                // TPC-H shipmodes — first char is a unique branchless discriminator.
-                const char m0 = shipmode[i][0];
-                const bool mail = (m0 == 'M');
-                const bool fob  = (m0 == 'F');
+                const uint8_t t = modetag[shipmode[i]];
                 buf_ok[m] = orderkey[i];
-                buf_fob[m] = fob ? 1 : 0;
-                m += (mail | fob);
+                buf_fob[m] = (t == 2) ? 1 : 0;
+                m += (t != 0);
             }
         }
 

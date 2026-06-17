@@ -32,6 +32,35 @@ static void extract_strings(const std::shared_ptr<arrow::ChunkedArray>& col, std
     }
 }
 
+// Extract a low-cardinality string column as dictionary codes + dictionary.
+// Linear scan over the (tiny) dictionary avoids hashing/allocation per row.
+static void extract_strings_dict(const std::shared_ptr<arrow::ChunkedArray>& col,
+                                 std::vector<uint8_t>& codes,
+                                 std::vector<std::string>& dict) {
+    codes.resize(col->length());
+    dict.clear();
+    int64_t offset = 0;
+    for (int c = 0; c < col->num_chunks(); c++) {
+        auto arr = std::static_pointer_cast<arrow::StringArray>(col->chunk(c));
+        for (int64_t i = 0; i < arr->length(); i++) {
+            auto sv = arr->GetView(i);
+            int code = -1;
+            for (size_t d = 0; d < dict.size(); d++) {
+                if (dict[d].size() == sv.size() &&
+                    std::memcmp(dict[d].data(), sv.data(), sv.size()) == 0) {
+                    code = (int)d;
+                    break;
+                }
+            }
+            if (code < 0) {
+                code = (int)dict.size();
+                dict.emplace_back(sv.data(), sv.size());
+            }
+            codes[offset++] = (uint8_t)code;
+        }
+    }
+}
+
 // Extract int32 column (handles both int32 and int64 source, uses memcpy where possible)
 static void extract_int32(const std::shared_ptr<arrow::ChunkedArray>& col, std::vector<int32_t>& out) {
     out.resize(col->length());
@@ -223,8 +252,8 @@ Database* build(ParquetTables* pt) {
         tasks.push_back([&]{ extract_date(get_col(pt->lineitem, "l_shipdate"), db->l_shipdate); });
         tasks.push_back([&]{ extract_date(get_col(pt->lineitem, "l_commitdate"), db->l_commitdate); });
         tasks.push_back([&]{ extract_date(get_col(pt->lineitem, "l_receiptdate"), db->l_receiptdate); });
-        tasks.push_back([&]{ extract_strings(get_col(pt->lineitem, "l_shipinstruct"), db->l_shipinstruct); });
-        tasks.push_back([&]{ extract_strings(get_col(pt->lineitem, "l_shipmode"), db->l_shipmode); });
+        tasks.push_back([&]{ extract_strings_dict(get_col(pt->lineitem, "l_shipinstruct"), db->l_shipinstruct_code, db->l_shipinstruct_dict); });
+        tasks.push_back([&]{ extract_strings_dict(get_col(pt->lineitem, "l_shipmode"), db->l_shipmode_code, db->l_shipmode_dict); });
 
         parallel_run(tasks);
     }

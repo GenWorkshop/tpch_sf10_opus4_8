@@ -101,8 +101,14 @@ struct Database {
     std::vector<Date> l_shipdate;
     std::vector<Date> l_commitdate;
     std::vector<Date> l_receiptdate;
-    std::vector<std::string> l_shipinstruct;
-    std::vector<std::string> l_shipmode;
+    // Low-cardinality string columns stored dictionary-encoded: a per-row
+    // uint8 code into a small dictionary of distinct values.  This is a general
+    // columnar encoding (full strings remain reconstructable via the dict) that
+    // shrinks the per-row footprint from a 32-byte std::string to a single byte.
+    std::vector<uint8_t> l_shipinstruct_code;
+    std::vector<std::string> l_shipinstruct_dict;
+    std::vector<uint8_t> l_shipmode_code;
+    std::vector<std::string> l_shipmode_dict;
 
     // Pre-computed: l_extendedprice * (1 - l_discount) in cents×100 (i.e. ×10000 from dollars)
     // Actually stored as: extendedprice_cents * (100 - discount_pct) to avoid floating point

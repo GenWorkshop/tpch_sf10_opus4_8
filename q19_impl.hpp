@@ -21,15 +21,26 @@ inline void run_q19_impl(Database* db, std::ostream& out) {
 
     __int128 revenue = 0;
 
+    // Resolve dictionary codes for the constant filter values at query time.
+    int deliver_code = -1;
+    for (size_t d = 0; d < db->l_shipinstruct_dict.size(); d++)
+        if (db->l_shipinstruct_dict[d] == "DELIVER IN PERSON") deliver_code = (int)d;
+
+    bool air_code[256] = {false};
+    for (size_t d = 0; d < db->l_shipmode_dict.size(); d++)
+        if (db->l_shipmode_dict[d] == "AIR" || db->l_shipmode_dict[d] == "AIR REG")
+            air_code[d] = true;
+
     {
         PROFILE_SCOPE("q19_lineitem_scan_join_filter");
+        const uint8_t* __restrict si = db->l_shipinstruct_code.data();
+        const uint8_t* __restrict sm = db->l_shipmode_code.data();
         for (int64_t i = 0; i < db->n_lineitem; i++) {
             TRACE_INC(li_scanned);
-            // Common filters first
-            if (db->l_shipinstruct[i] != "DELIVER IN PERSON") continue;
-            const auto& mode = db->l_shipmode[i];
-            if (mode != "AIR" && mode != "AIR REG") continue;
-
+            // Common filters first: single-byte dictionary-code comparisons
+            // instead of streaming 32-byte std::string objects per row.
+            if (si[i] != deliver_code) continue;
+            if (!air_code[sm[i]]) continue;
             int32_t partkey = db->l_partkey[i];
             int32_t p_idx = partkey - 1;
             if (p_idx < 0 || p_idx >= db->n_part) continue;
