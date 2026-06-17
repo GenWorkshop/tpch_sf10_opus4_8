@@ -6,6 +6,44 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <immintrin.h>
+
+// SIMD pass-1 for q19: scan the two single-byte dictionary columns 32 lanes at
+// a time, testing (l_shipinstruct == DELIVER) AND (l_shipmode IN air codes),
+// and left-pack the surviving row indices.  Survivors are sparse (~7%), so the
+// bit-iteration inner loop is cheap while the 60M-row scan stays vectorized.
+__attribute__((target("avx2")))
+static int64_t q19_pass1_avx2(const uint8_t* __restrict si,
+                              const uint8_t* __restrict sm,
+                              int64_t n, int deliver_code,
+                              int aira, int airb,
+                              int32_t* __restrict cand) {
+    const __m256i vdel  = _mm256_set1_epi8((char)deliver_code);
+    const __m256i vaira = _mm256_set1_epi8((char)aira);
+    const __m256i vairb = _mm256_set1_epi8((char)airb);
+    int64_t cnt = 0;
+    int64_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        __m256i s = _mm256_loadu_si256((const __m256i*)(si + i));
+        __m256i m = _mm256_loadu_si256((const __m256i*)(sm + i));
+        __m256i md = _mm256_cmpeq_epi8(s, vdel);
+        __m256i ma = _mm256_or_si256(_mm256_cmpeq_epi8(m, vaira),
+                                     _mm256_cmpeq_epi8(m, vairb));
+        uint32_t bits = (uint32_t)_mm256_movemask_epi8(_mm256_and_si256(md, ma));
+        while (bits) {
+            int b = __builtin_ctz(bits);
+            cand[cnt++] = (int32_t)(i + b);
+            bits &= bits - 1;
+        }
+    }
+    for (; i < n; i++) {
+        const int keep = (si[i] == deliver_code) &
+                         ((sm[i] == aira) | (sm[i] == airb));
+        cand[cnt] = (int32_t)i;
+        cnt += keep;
+    }
+    return cnt;
+}
 
 inline void run_q19_impl(Database* db, std::ostream& out) {
     PROFILE_SCOPE("q19_total");
@@ -28,10 +66,14 @@ inline void run_q19_impl(Database* db, std::ostream& out) {
     for (size_t d = 0; d < db->l_shipinstruct_dict.size(); d++)
         if (db->l_shipinstruct_dict[d] == "DELIVER IN PERSON") deliver_code = (int)d;
 
-    bool air_code[256] = {false};
+    int aira = -1, airb = -1;
     for (size_t d = 0; d < db->l_shipmode_dict.size(); d++)
-        if (db->l_shipmode_dict[d] == "AIR" || db->l_shipmode_dict[d] == "AIR REG")
-            air_code[d] = true;
+        if (db->l_shipmode_dict[d] == "AIR" || db->l_shipmode_dict[d] == "AIR REG") {
+            if (aira < 0) aira = (int)d; else airb = (int)d;
+        }
+    if (aira < 0) aira = 255;          // no AIR code present → never matches
+    if (airb < 0) airb = aira;
+    if (deliver_code < 0) deliver_code = 255;  // sentinel, never matches a code
 
     // Build side of the hash join (mirrors the plan's HASH_JOIN on `part`):
     // scan the 2M-row part table once and reduce each part to a single group
@@ -97,17 +139,10 @@ inline void run_q19_impl(Database* db, std::ostream& out) {
         const uint8_t* __restrict pg = pgroup.data();
         const int64_t n = db->n_lineitem;
 
-        // Pass 1: branchless collection of rows passing the two single-byte
-        // dictionary filters.  Writing the index unconditionally and advancing
-        // the cursor by the (0/1) predicate removes the hard-to-predict branch
-        // that otherwise dominates the 60M-row scan.
+        // Pass 1: SIMD-vectorized branchless collection of rows passing the two
+        // single-byte dictionary filters.
         std::unique_ptr<int32_t[]> cand(new int32_t[n]);
-        int64_t cnt = 0;
-        for (int64_t i = 0; i < n; i++) {
-            const int keep = (si[i] == deliver_code) & (int)air_code[sm[i]];
-            cand[cnt] = (int32_t)i;
-            cnt += keep;
-        }
+        int64_t cnt = q19_pass1_avx2(si, sm, n, deliver_code, aira, airb, cand.get());
         TRACE_ADD(li_scanned, (uint64_t)n);
 
         // Pass 2: probe the L2-resident part-group table for the surviving
