@@ -58,46 +58,38 @@ inline void run_q10_impl(Database* db, std::ostream& out) {
     TRACE_COUNT("q10_join_rows_emitted", li_emitted);
     TRACE_COUNT("q10_agg_rows_in", li_emitted);
 
-    // Build result rows
-    struct ResultRow {
-        int32_t c_custkey;
+    // Two-pass output to keep customer-column access cache-friendly:
+    //  Pass 1 walks customers in custkey order (sequential over the column
+    //  arrays) and serializes each qualifying row into a compact fragment
+    //  buffer.  Pass 2 sorts tiny fixed-size records by revenue and stitches
+    //  the pre-formatted fragments together.  This moves the random,
+    //  cache-missing access off the scattered std::string heap data and onto a
+    //  single dense fragment buffer.
+    struct Rec {
         int64_t revenue;
+        uint32_t off;
+        uint32_t len;
     };
-    std::vector<ResultRow> results;
-    for (int32_t ck = 1; ck <= db->n_customer; ck++) {
-        if (cust_revenue[ck] != 0) results.push_back({ck, cust_revenue[ck]});
-    }
-    TRACE_COUNT("q10_groups_created", (uint64_t)results.size());
-    TRACE_COUNT("q10_agg_rows_emitted", (uint64_t)results.size());
-
-    // Order by revenue desc
-    TRACE_COUNT("q10_sort_rows_in", (uint64_t)results.size());
+    std::vector<Rec> recs;
     {
-        PROFILE_SCOPE("q10_sort");
-        std::sort(results.begin(), results.end(), [](const ResultRow& a, const ResultRow& b) {
-            return a.revenue > b.revenue;
-        });
+        size_t est = 0;
+        for (int32_t ck = 1; ck <= db->n_customer; ck++)
+            if (cust_revenue[ck] != 0) est++;
+        recs.reserve(est);
     }
-    TRACE_COUNT("q10_sort_rows_out", (uint64_t)results.size());
 
-    PROFILE_SCOPE("q10_output");
-    write_csv_header(out, {"c_custkey","c_name","revenue","c_acctbal","n_name","c_address","c_phone","c_comment"});
-
-    // Fast manual CSV serialization into a single buffer.  Avoids per-field
-    // std::string allocations and ostringstream overhead in the hot output
-    // loop (which dominates this query's runtime).
-    std::string buf;
-    buf.reserve((size_t)results.size() * 160 + 64);
+    std::string frag;
+    frag.reserve(recs.capacity() * 160 + 64);
 
     char numbuf[32];
     auto append_int = [&](int64_t v) {
-        if (v == 0) { buf.push_back('0'); return; }
+        if (v == 0) { frag.push_back('0'); return; }
         bool neg = v < 0;
         uint64_t u = neg ? (uint64_t)(-v) : (uint64_t)v;
         char* p = numbuf + sizeof(numbuf);
         while (u) { *--p = char('0' + (u % 10)); u /= 10; }
         if (neg) *--p = '-';
-        buf.append(p, numbuf + sizeof(numbuf) - p);
+        frag.append(p, numbuf + sizeof(numbuf) - p);
     };
     auto append_money = [&](int64_t cents, int scale) {
         bool neg = cents < 0;
@@ -108,63 +100,77 @@ inline void run_q10_impl(Database* db, std::ostream& out) {
         if (u == 0) { *--p = '0'; }
         else { while (u) { *--p = char('0' + (u % 10)); u /= 10; } }
         if (neg) *--p = '-';
-        buf.append(p, numbuf + sizeof(numbuf) - p);
+        frag.append(p, numbuf + sizeof(numbuf) - p);
     };
+    static const bool* SPECIAL = []{
+        static bool t[256] = {false};
+        t[(unsigned char)','] = true;
+        t[(unsigned char)'"'] = true;
+        t[(unsigned char)'\n'] = true;
+        t[(unsigned char)'\r'] = true;
+        t[(unsigned char)'\\'] = true;
+        return t;
+    }();
     auto append_quoted = [&](const std::string& s) {
-        static const bool* SPECIAL = []{
-            static bool t[256] = {false};
-            t[(unsigned char)','] = true;
-            t[(unsigned char)'"'] = true;
-            t[(unsigned char)'\n'] = true;
-            t[(unsigned char)'\r'] = true;
-            t[(unsigned char)'\\'] = true;
-            return t;
-        }();
         const char* d = s.data();
         const size_t n = s.size();
         bool needs = false;
         for (size_t k = 0; k < n; k++) {
             if (SPECIAL[(unsigned char)d[k]]) { needs = true; break; }
         }
-        if (!needs) { buf.append(d, n); return; }
-        buf.push_back('"');
+        if (!needs) { frag.append(d, n); return; }
+        frag.push_back('"');
         for (size_t k = 0; k < n; k++) {
-            if (d[k] == '"') buf.push_back('"');
-            buf.push_back(d[k]);
+            if (d[k] == '"') frag.push_back('"');
+            frag.push_back(d[k]);
         }
-        buf.push_back('"');
+        frag.push_back('"');
     };
 
-    const size_t nres = results.size();
-    const int PD_FAR = 48;
-    const int PD_NEAR = 16;
-    for (size_t i = 0; i < nres; i++) {
-        if (i + PD_FAR < nres) {
-            int32_t fidx = results[i + PD_FAR].c_custkey - 1;
-            __builtin_prefetch(&db->c_name[fidx]);
-            __builtin_prefetch(&db->c_address[fidx]);
-            __builtin_prefetch(&db->c_phone[fidx]);
-            __builtin_prefetch(&db->c_comment[fidx]);
-        }
-        if (i + PD_NEAR < nres) {
-            int32_t nidx = results[i + PD_NEAR].c_custkey - 1;
-            __builtin_prefetch(db->c_name[nidx].data());
-            __builtin_prefetch(db->c_address[nidx].data());
-            __builtin_prefetch(db->c_comment[nidx].data());
-        }
-        const ResultRow& r = results[i];
-        int32_t c_idx = r.c_custkey - 1;
+    // Pass 1: sequential over customers, serialize qualifying rows.
+    for (int32_t ck = 1; ck <= db->n_customer; ck++) {
+        int64_t rev = cust_revenue[ck];
+        if (rev == 0) continue;
+        int32_t c_idx = ck - 1;
         int32_t nk = db->c_nationkey[c_idx];
-        append_int(r.c_custkey);            buf.push_back(',');
-        append_quoted(db->c_name[c_idx]);   buf.push_back(',');
-        append_money(r.revenue, 4);         buf.push_back(',');
-        append_money(db->c_acctbal[c_idx], 2); buf.push_back(',');
-        append_quoted(db->n_name[nk]);      buf.push_back(',');
-        append_quoted(db->c_address[c_idx]); buf.push_back(',');
-        append_quoted(db->c_phone[c_idx]);  buf.push_back(',');
+        uint32_t off = (uint32_t)frag.size();
+        append_int(ck);                       frag.push_back(',');
+        append_quoted(db->c_name[c_idx]);     frag.push_back(',');
+        append_money(rev, 4);                 frag.push_back(',');
+        append_money(db->c_acctbal[c_idx], 2); frag.push_back(',');
+        append_quoted(db->n_name[nk]);        frag.push_back(',');
+        append_quoted(db->c_address[c_idx]);  frag.push_back(',');
+        append_quoted(db->c_phone[c_idx]);    frag.push_back(',');
         append_quoted(db->c_comment[c_idx]);
-        buf.push_back('\n');
+        frag.push_back('\n');
+        recs.push_back({rev, off, (uint32_t)(frag.size() - off)});
+    }
+    TRACE_COUNT("q10_groups_created", (uint64_t)recs.size());
+    TRACE_COUNT("q10_agg_rows_emitted", (uint64_t)recs.size());
+
+    // Order by revenue desc
+    TRACE_COUNT("q10_sort_rows_in", (uint64_t)recs.size());
+    {
+        PROFILE_SCOPE("q10_sort");
+        std::sort(recs.begin(), recs.end(), [](const Rec& a, const Rec& b) {
+            return a.revenue > b.revenue;
+        });
+    }
+    TRACE_COUNT("q10_sort_rows_out", (uint64_t)recs.size());
+
+    PROFILE_SCOPE("q10_output");
+    write_csv_header(out, {"c_custkey","c_name","revenue","c_acctbal","n_name","c_address","c_phone","c_comment"});
+
+    // Pass 2: stitch fragments in revenue order into the final buffer.
+    std::string buf;
+    buf.reserve(frag.size() + 64);
+    const char* fbase = frag.data();
+    const size_t nres = recs.size();
+    const int PD = 24;
+    for (size_t i = 0; i < nres; i++) {
+        if (i + PD < nres) __builtin_prefetch(fbase + recs[i + PD].off);
+        buf.append(fbase + recs[i].off, recs[i].len);
     }
     out.write(buf.data(), (std::streamsize)buf.size());
-    TRACE_COUNT("q10_query_output_rows", (uint64_t)results.size());
+    TRACE_COUNT("q10_query_output_rows", (uint64_t)recs.size());
 }
