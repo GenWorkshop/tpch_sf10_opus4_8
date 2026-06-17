@@ -8,6 +8,28 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
+#include <immintrin.h>
+
+__attribute__((target("avx2")))
+inline void q18_collect_big_orders(const int32_t* __restrict qsum, int32_t n,
+                                   int32_t thresh, std::vector<int32_t>& out) {
+    const __m256i vth = _mm256_set1_epi32(thresh);
+    int32_t i = 0;
+    int32_t lim = n - 7;
+    for (; i < lim; i += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i*)(qsum + i));
+        __m256i cmp = _mm256_cmpgt_epi32(v, vth);
+        int m = _mm256_movemask_ps(_mm256_castsi256_ps(cmp));
+        while (m) {
+            int b = __builtin_ctz(m);
+            out.push_back(i + b);
+            m &= m - 1;
+        }
+    }
+    for (; i < n; i++) {
+        if (qsum[i] > thresh) out.push_back(i);
+    }
+}
 
 inline void run_q18_impl(Database* db, std::ostream& out) {
     PROFILE_SCOPE("q18_total");
@@ -50,20 +72,17 @@ inline void run_q18_impl(Database* db, std::ostream& out) {
     {
         PROFILE_SCOPE("q18_order_join");
         const int32_t qty_thresh32 = (int32_t)qty_threshold;
-        for (int32_t o_idx = 0; o_idx < n_orders; o_idx++) {
-            int32_t sum = order_qty_sum[o_idx];
-            if (sum <= qty_thresh32) continue;
-
-            int32_t custkey = db->o_custkey[o_idx];
-            int32_t c_idx = custkey - 1;
-
+        std::vector<int32_t> big;
+        q18_collect_big_orders(order_qty_sum.data(), n_orders, qty_thresh32, big);
+        for (int32_t oi : big) {
+            int32_t custkey = db->o_custkey[oi];
             results.push_back({
-                db->c_name[c_idx],
+                db->c_name[custkey - 1],
                 custkey,
-                db->o_orderkey[o_idx],
-                db->o_orderdate[o_idx],
-                db->o_totalprice[o_idx],
-                sum
+                db->o_orderkey[oi],
+                db->o_orderdate[oi],
+                db->o_totalprice[oi],
+                order_qty_sum[oi]
             });
         }
     }
