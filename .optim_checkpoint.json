@@ -2,5 +2,7 @@
   "step": 3,
   "completed_queries": [],
   "current_query": "q1",
-  "completed_stages": []
+  "completed_stages": [
+    "sample_plan"
+  ]
 }
