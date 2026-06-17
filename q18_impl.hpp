@@ -15,36 +15,27 @@ inline void run_q18_impl(Database* db, std::ostream& out) {
     // First: find orderkeys where sum(l_quantity) > 314 (scale 2: 31400)
     const int64_t qty_threshold = 31400; // 314 * 100
 
-    // Compute sum(l_quantity) per orderkey
-    std::unordered_map<int32_t, int64_t> order_qty_sum;
+    // Compute sum(l_quantity) per order using a dense array indexed by order
+    // row index (via orderkey_to_idx). Avoids hashing the 60M-row scan.
+    // Per-order quantity sum fits comfortably in int32 (max ~7 lineitems × 50 × 100).
+    const int32_t n_orders = db->n_orders;
+    std::vector<int32_t> order_qty_sum(n_orders, 0);
+    const int32_t* __restrict ok_to_idx = db->orderkey_to_idx.data();
     {
         PROFILE_SCOPE("q18_lineitem_scan_agg");
-        for (int64_t i = 0; i < db->n_lineitem; i++) {
+        const int32_t* __restrict lok = db->l_orderkey.data();
+        const int64_t* __restrict lqty = db->l_quantity.data();
+        const int64_t n = db->n_lineitem;
+        for (int64_t i = 0; i < n; i++) {
             TRACE_INC(li_scanned);
-            order_qty_sum[db->l_orderkey[i]] += db->l_quantity[i];
+            int32_t o_idx = ok_to_idx[lok[i]];
+            order_qty_sum[o_idx] += (int32_t)lqty[i];
         }
     }
     TRACE_COUNT("q18_rows_scanned", li_scanned);
     TRACE_COUNT("q18_agg_rows_in", li_scanned);
-    TRACE_COUNT("q18_groups_created", (uint64_t)order_qty_sum.size());
+    TRACE_COUNT("q18_groups_created", (uint64_t)n_orders);
 
-    // Filter orders with sum > threshold
-    std::unordered_set<int32_t> big_orders;
-    for (auto& [ok, sum] : order_qty_sum) {
-        if (sum > qty_threshold) {
-            big_orders.insert(ok);
-        }
-    }
-    TRACE_COUNT("q18_big_orders", (uint64_t)big_orders.size());
-
-    if (big_orders.empty()) {
-        write_csv_header(out, {"c_name","c_custkey","o_orderkey","o_orderdate","o_totalprice","sum(l_quantity)"});
-        TRACE_COUNT("q18_query_output_rows", 0);
-        return;
-    }
-
-    // For qualifying orders, compute sum(l_quantity) per order from lineitem
-    // (already have it in order_qty_sum)
     // Build result rows
     struct ResultRow {
         std::string c_name;
@@ -58,10 +49,10 @@ inline void run_q18_impl(Database* db, std::ostream& out) {
 
     {
         PROFILE_SCOPE("q18_order_join");
-        for (int32_t ok : big_orders) {
-            if (ok > db->max_orderkey) continue;
-            int32_t o_idx = db->orderkey_to_idx[ok];
-            if (o_idx < 0) continue;
+        const int32_t qty_thresh32 = (int32_t)qty_threshold;
+        for (int32_t o_idx = 0; o_idx < n_orders; o_idx++) {
+            int32_t sum = order_qty_sum[o_idx];
+            if (sum <= qty_thresh32) continue;
 
             int32_t custkey = db->o_custkey[o_idx];
             int32_t c_idx = custkey - 1;
@@ -69,10 +60,10 @@ inline void run_q18_impl(Database* db, std::ostream& out) {
             results.push_back({
                 db->c_name[c_idx],
                 custkey,
-                ok,
+                db->o_orderkey[o_idx],
                 db->o_orderdate[o_idx],
                 db->o_totalprice[o_idx],
-                order_qty_sum[ok]
+                sum
             });
         }
     }
