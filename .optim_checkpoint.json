@@ -8,6 +8,7 @@
   "current_query": "q4",
   "completed_stages": [
     "sample_plan",
-    "trace"
+    "trace",
+    "expert_knowledge"
   ]
 }
