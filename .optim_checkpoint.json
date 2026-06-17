@@ -16,6 +16,7 @@
   "current_query": "q12",
   "completed_stages": [
     "sample_plan",
-    "trace"
+    "trace",
+    "expert_knowledge"
   ]
 }
