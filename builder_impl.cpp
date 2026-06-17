@@ -27,24 +27,40 @@ static void extract_strings(const std::shared_ptr<arrow::ChunkedArray>& col, std
     }
 }
 
-// Extract int32 column
+// Extract int32 column (handles both int32 and int64 source)
 static void extract_int32(const std::shared_ptr<arrow::ChunkedArray>& col, std::vector<int32_t>& out) {
     out.reserve(col->length());
     for (int c = 0; c < col->num_chunks(); c++) {
-        auto arr = std::static_pointer_cast<arrow::Int32Array>(col->chunk(c));
-        for (int64_t i = 0; i < arr->length(); i++) {
-            out.push_back(arr->Value(i));
+        auto chunk = col->chunk(c);
+        if (chunk->type_id() == arrow::Type::INT32) {
+            auto arr = std::static_pointer_cast<arrow::Int32Array>(chunk);
+            for (int64_t i = 0; i < arr->length(); i++) {
+                out.push_back(arr->Value(i));
+            }
+        } else if (chunk->type_id() == arrow::Type::INT64) {
+            auto arr = std::static_pointer_cast<arrow::Int64Array>(chunk);
+            for (int64_t i = 0; i < arr->length(); i++) {
+                out.push_back(static_cast<int32_t>(arr->Value(i)));
+            }
         }
     }
 }
 
-// Extract int64 column
+// Extract int64 column (handles both int32 and int64 source)
 static void extract_int64(const std::shared_ptr<arrow::ChunkedArray>& col, std::vector<int64_t>& out) {
     out.reserve(col->length());
     for (int c = 0; c < col->num_chunks(); c++) {
-        auto arr = std::static_pointer_cast<arrow::Int64Array>(col->chunk(c));
-        for (int64_t i = 0; i < arr->length(); i++) {
-            out.push_back(arr->Value(i));
+        auto chunk = col->chunk(c);
+        if (chunk->type_id() == arrow::Type::INT64) {
+            auto arr = std::static_pointer_cast<arrow::Int64Array>(chunk);
+            for (int64_t i = 0; i < arr->length(); i++) {
+                out.push_back(arr->Value(i));
+            }
+        } else if (chunk->type_id() == arrow::Type::INT32) {
+            auto arr = std::static_pointer_cast<arrow::Int32Array>(chunk);
+            for (int64_t i = 0; i < arr->length(); i++) {
+                out.push_back(static_cast<int64_t>(arr->Value(i)));
+            }
         }
     }
 }

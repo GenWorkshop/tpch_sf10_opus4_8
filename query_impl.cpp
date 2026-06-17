@@ -9,6 +9,8 @@
 
 #include "args_parser.hpp"
 #include "query_utils.hpp"
+#include "q1_impl.hpp"
+#include "q2_impl.hpp"
 
 // Forward declarations for each query
 static void run_q1(Database* db, const std::string& args, std::ostream& out);
@@ -103,11 +105,11 @@ void query(Database* db) {
 // Each writes an empty CSV (header only) for now
 
 static void run_q1(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"l_returnflag","l_linestatus","sum_qty","sum_base_price","sum_disc_price","sum_charge","avg_qty","avg_price","avg_disc","count_order"});
+    run_q1_impl(db, out);
 }
 
 static void run_q2(Database* db, const std::string& args, std::ostream& out) {
-    write_csv_header(out, {"s_acctbal","s_name","n_name","p_partkey","p_mfgr","s_address","s_phone","s_comment"});
+    run_q2_impl(db, out);
 }
 
 static void run_q3(Database* db, const std::string& args, std::ostream& out) {
