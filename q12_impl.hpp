@@ -18,41 +18,62 @@ inline void run_q12_impl(Database* db, std::ostream& out) {
         int64_t high_count = 0;
         int64_t low_count = 0;
     };
-    std::map<std::string, Agg> groups;
+
+    // Two fixed groups (MAIL, FOB) avoid std::map / string-keyed lookups in the
+    // hot loop.  Cheap integer date predicates run first so the std::string
+    // shipmode column is only touched for the small surviving fraction of rows.
+    Agg agg_mail;
+    Agg agg_fob;
+    const Date* __restrict commitdate  = db->l_commitdate.data();
+    const Date* __restrict receiptdate = db->l_receiptdate.data();
+    const Date* __restrict shipdate    = db->l_shipdate.data();
+    const int32_t* __restrict orderkey = db->l_orderkey.data();
+    const std::string* __restrict shipmode = db->l_shipmode.data();
 
     {
         PROFILE_SCOPE("q12_lineitem_scan_join_agg");
-        for (int64_t i = 0; i < db->n_lineitem; i++) {
+        const int64_t n = db->n_lineitem;
+        for (int64_t i = 0; i < n; i++) {
             TRACE_INC(li_scanned);
+            // l_receiptdate >= date_lo AND < date_hi  (most selective, cheap int)
+            const Date rd = receiptdate[i];
+            if (rd < date_lo || rd >= date_hi) continue;
+
+            // l_shipdate < l_commitdate < l_receiptdate
+            const Date cd = commitdate[i];
+            if (cd >= rd) continue;
+            if (shipdate[i] >= cd) continue;
+
             // l_shipmode in ('MAIL', 'FOB')
-            const auto& mode = db->l_shipmode[i];
-            if (mode != "MAIL" && mode != "FOB") continue;
+            const std::string& mode = shipmode[i];
+            Agg* g;
+            if (mode == "MAIL") {
+                g = &agg_mail;
+            } else if (mode == "FOB") {
+                g = &agg_fob;
+            } else {
+                continue;
+            }
 
-            // l_commitdate < l_receiptdate
-            if (db->l_commitdate[i] >= db->l_receiptdate[i]) continue;
-
-            // l_shipdate < l_commitdate
-            if (db->l_shipdate[i] >= db->l_commitdate[i]) continue;
-
-            // l_receiptdate >= date_lo AND < date_hi
-            if (db->l_receiptdate[i] < date_lo || db->l_receiptdate[i] >= date_hi) continue;
-
-            // Get order priority
-            int32_t orderkey = db->l_orderkey[i];
-            if (orderkey > db->max_orderkey) continue;
-            int32_t o_idx = db->orderkey_to_idx[orderkey];
+            // Get order priority (perfect-hash probe into orders)
+            int32_t ok = orderkey[i];
+            if (ok > db->max_orderkey) continue;
+            int32_t o_idx = db->orderkey_to_idx[ok];
             if (o_idx < 0) continue;
 
             TRACE_INC(li_emitted);
-            const auto& prio = db->o_orderpriority[o_idx];
-            auto& g = groups[mode];
+            const std::string& prio = db->o_orderpriority[o_idx];
             if (prio == "1-URGENT" || prio == "2-HIGH") {
-                g.high_count++;
+                g->high_count++;
             } else {
-                g.low_count++;
+                g->low_count++;
             }
         }
     }
+
+    std::map<std::string, Agg> groups;
+    groups["FOB"] = agg_fob;
+    groups["MAIL"] = agg_mail;
     TRACE_COUNT("q12_rows_scanned", li_scanned);
     TRACE_COUNT("q12_join_rows_emitted", li_emitted);
     TRACE_COUNT("q12_agg_rows_in", li_emitted);
