@@ -5,6 +5,7 @@
 #include <vector>
 #include <algorithm>
 #include <climits>
+#include <immintrin.h>
 
 // TPC-H Q21.  RUSSIA suppliers that are the SOLE late supplier on a multi-
 // supplier 'F' order.  The DuckDB plan groups lineitem by (l_orderkey) and
@@ -21,6 +22,57 @@
 // An order contributes to supplier `ls = late_supp` when it is 'F', has a sole
 // late supplier (bit1 clear, ls != 0), has another supplier (bit0 set) and ls
 // is a RUSSIA supplier.
+__attribute__((target("avx2")))
+static inline void q21_scan_sorted(
+    const int32_t* __restrict ok_col, const int32_t* __restrict sk_col,
+    const Date* __restrict rcpt, const Date* __restrict cmit, int64_t n,
+    const int32_t* __restrict o_okey, const char* __restrict o_stat,
+    int32_t n_ord, const uint8_t* __restrict is_russia,
+    int64_t* __restrict supp_numwait) {
+    int32_t oj = 0;
+    int64_t i = 0;
+    while (i < n) {
+        const int32_t ok = ok_col[i];
+        // Locate the end of this orderkey run with an AVX2 scan: most runs
+        // (TPC-H: 1-7 lines) terminate inside the first 8-lane compare, so
+        // boundary detection costs ~1 vector op instead of a mispredicting
+        // per-row branch.
+        int64_t e = i;
+        const __m256i vok = _mm256_set1_epi32(ok);
+        bool done = false;
+        while (e + 8 <= n) {
+            __m256i v = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(ok_col + e));
+            unsigned m = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(
+                _mm256_cmpeq_epi32(v, vok)));
+            if (m != 0xFFu) { e += __builtin_ctz(~m); done = true; break; }
+            e += 8;
+        }
+        if (!done) while (e < n && ok_col[e] == ok) e++;
+
+        while (oj < n_ord && o_okey[oj] < ok) oj++;
+        const bool isF = (oj < n_ord && o_okey[oj] == ok && o_stat[oj] == 'F');
+        if (isF) {
+            int32_t min_sk = INT32_MAX, max_sk = 0;
+            int32_t late_min = INT32_MAX, late_max = 0;
+            for (int64_t j = i; j < e; j++) {    // counted loop, no boundary branch
+                const int32_t sk = sk_col[j];
+                min_sk = std::min(min_sk, sk);
+                max_sk = std::max(max_sk, sk);
+                const bool late = rcpt[j] > cmit[j];
+                late_min = std::min(late_min, late ? sk : INT32_MAX);
+                late_max = std::max(late_max, late ? sk : 0);
+            }
+            if (max_sk != min_sk &&          // >=2 distinct suppliers (EXISTS)
+                late_max != 0 &&             // at least one late supplier
+                late_max == late_min &&      // exactly one late supplier
+                is_russia[late_min])
+                supp_numwait[late_min]++;
+        }
+        i = e;
+    }
+}
+
 inline void run_q21_impl(Database* db, std::ostream& out) {
     PROFILE_SCOPE("q21_total");
     TRACE_DECL_COUNTER(li_scanned);
@@ -46,44 +98,13 @@ inline void run_q21_impl(Database* db, std::ostream& out) {
     const int64_t n = db->n_lineitem;
 
     if (db->lineitem_sorted_by_orderkey && db->orders_sorted_by_orderkey) {
-        // Both tables clustered by orderkey: merge-walk them in lockstep.  The
-        // 'F' status is read sequentially from o_orderstatus (no 60MB
-        // orderkey-indexed bitmap to build or scatter-read).  The per-run
-        // reduction is branchless via running min/max:
-        //   multi      (>=2 suppliers)      == (max_sk != min_sk)
-        //   late_supp  (sole late supplier) == late_min (== late_max)
+        // Both tables clustered by orderkey: merge-walk them in lockstep, using
+        // an AVX2 run-boundary scan and a branchless min/max per-order
+        // reduction (multi == max_sk!=min_sk; sole late supplier == late_min).
         PROFILE_SCOPE("q21_lineitem_scan_join");
-        const char* __restrict o_stat = db->o_orderstatus.data();
-        const int32_t* __restrict o_okey = db->o_orderkey.data();
-        const int32_t n_ord = db->n_orders;
-        int32_t oj = 0;
-        int64_t i = 0;
-        while (i < n) {
-            const int32_t ok = ok_col[i];
-            while (oj < n_ord && o_okey[oj] < ok) oj++;
-            const bool isF = (oj < n_ord && o_okey[oj] == ok && o_stat[oj] == 'F');
-            if (!isF) {
-                do { i++; } while (i < n && ok_col[i] == ok);
-                continue;
-            }
-            int32_t min_sk = INT32_MAX, max_sk = 0;
-            int32_t late_min = INT32_MAX, late_max = 0;
-            do {
-                const int32_t sk = sk_col[i];
-                min_sk = std::min(min_sk, sk);
-                max_sk = std::max(max_sk, sk);
-                const bool late = rcpt[i] > cmit[i];
-                late_min = std::min(late_min, late ? sk : INT32_MAX);
-                late_max = std::max(late_max, late ? sk : 0);
-                i++;
-            } while (i < n && ok_col[i] == ok);
-
-            if (max_sk != min_sk &&            // >=2 distinct suppliers (EXISTS)
-                late_max != 0 &&               // at least one late supplier
-                late_max == late_min &&        // exactly one late supplier
-                is_russia[late_min])
-                supp_numwait[late_min]++;
-        }
+        q21_scan_sorted(ok_col, sk_col, rcpt, cmit, n,
+                        db->o_orderkey.data(), db->o_orderstatus.data(),
+                        db->n_orders, is_russia.data(), supp_numwait.data());
         TRACE_COUNT("q21_rows_scanned", li_scanned);
         TRACE_COUNT("q21_join_rows_emitted", li_emitted);
         goto finalize;
