@@ -3,123 +3,115 @@
 #include "query_utils.hpp"
 #include <ostream>
 #include <vector>
-#include <unordered_set>
-#include <unordered_map>
 #include <algorithm>
 
+// TPC-H Q21.  RUSSIA suppliers that are the SOLE late supplier on a multi-
+// supplier 'F' order.  The DuckDB plan groups lineitem by (l_orderkey) and
+// resolves the EXISTS / NOT-EXISTS correlated subqueries as per-order
+// aggregates.  We mirror that with dense arrays indexed by orderkey instead of
+// a hash map, so the 60M-row lineitem scan does no hashing or per-order
+// allocation.
+//
+// Per order we track:
+//   first_supp : first supplier seen        (0 = unseen)
+//   late_supp  : first late supplier seen   (0 = none late)
+//   flag bit0  : >=2 distinct suppliers      (the EXISTS other-supplier test)
+//   flag bit1  : >=2 distinct late suppliers (kills the NOT-EXISTS test)
+// An order contributes to supplier `ls = late_supp` when it is 'F', has a sole
+// late supplier (bit1 clear, ls != 0), has another supplier (bit0 set) and ls
+// is a RUSSIA supplier.
 inline void run_q21_impl(Database* db, std::ostream& out) {
     PROFILE_SCOPE("q21_total");
     TRACE_DECL_COUNTER(li_scanned);
     TRACE_DECL_COUNTER(li_emitted);
-    // n_name = 'RUSSIA' → nationkey
-    int32_t russia_nk = db->nation_name_to_key["RUSSIA"];
 
-    // Suppliers in RUSSIA
-    std::unordered_set<int32_t> russia_suppkeys; // 1-based
+    const int32_t russia_nk = db->nation_name_to_key["RUSSIA"];
+
+    // RUSSIA suppliers: dense bool indexed by suppkey (1-based).
+    std::vector<uint8_t> is_russia(db->n_supplier + 1, 0);
     for (int32_t i = 0; i < db->n_supplier; i++) {
-        if (db->s_nationkey[i] == russia_nk) {
-            russia_suppkeys.insert(i + 1);
-        }
+        if (db->s_nationkey[i] == russia_nk) is_russia[i + 1] = 1;
     }
 
-    // Orders with o_orderstatus = 'F'
-    std::vector<bool> order_is_F(db->max_orderkey + 1, false);
+    const int32_t maxok = db->max_orderkey;
+
+    // o_orderstatus = 'F', indexed by orderkey.
+    std::vector<uint8_t> order_is_F(maxok + 1, 0);
     for (int32_t i = 0; i < db->n_orders; i++) {
-        if (db->o_orderstatus[i] == 'F') {
-            order_is_F[db->o_orderkey[i]] = true;
-        }
+        if (db->o_orderstatus[i] == 'F') order_is_F[db->o_orderkey[i]] = 1;
     }
 
-    // For each orderkey, collect (suppkey, is_late) pairs
-    // We need:
-    // l1: RUSSIA supplier, receipt > commit (late), order is F
-    // EXISTS l2: same order, different supplier
-    // NOT EXISTS l3: same order, different supplier, also late
-
-    // Build per-order info: set of suppkeys and set of late suppkeys
-    struct OrderInfo {
-        std::vector<int32_t> suppkeys;
-        std::unordered_set<int32_t> late_suppkeys; // those with receipt > commit
-    };
-
-    std::unordered_map<int32_t, OrderInfo> order_info;
+    // Per-order aggregates, indexed by orderkey.
+    std::vector<int32_t> first_supp(maxok + 1, 0);
+    std::vector<int32_t> late_supp(maxok + 1, 0);
+    std::vector<uint8_t> flag(maxok + 1, 0);
 
     {
         PROFILE_SCOPE("q21_lineitem_scan_join");
-        for (int64_t i = 0; i < db->n_lineitem; i++) {
+        const int32_t* __restrict ok_col = db->l_orderkey.data();
+        const int32_t* __restrict sk_col = db->l_suppkey.data();
+        const Date* __restrict rcpt = db->l_receiptdate.data();
+        const Date* __restrict cmit = db->l_commitdate.data();
+        const int64_t n = db->n_lineitem;
+        for (int64_t i = 0; i < n; i++) {
             TRACE_INC(li_scanned);
-            int32_t ok = db->l_orderkey[i];
-            if (ok > db->max_orderkey || !order_is_F[ok]) continue;
-
+            const int32_t ok = ok_col[i];
+            if (ok > maxok || !order_is_F[ok]) continue;
             TRACE_INC(li_emitted);
-            auto& info = order_info[ok];
-            int32_t sk = db->l_suppkey[i];
-            info.suppkeys.push_back(sk);
-            if (db->l_receiptdate[i] > db->l_commitdate[i]) {
-                info.late_suppkeys.insert(sk);
+
+            const int32_t sk = sk_col[i];
+            const int32_t fs = first_supp[ok];
+            if (fs == 0) first_supp[ok] = sk;
+            else if (sk != fs) flag[ok] |= 1;
+
+            if (rcpt[i] > cmit[i]) {
+                const int32_t ls = late_supp[ok];
+                if (ls == 0) late_supp[ok] = sk;
+                else if (sk != ls) flag[ok] |= 2;
             }
         }
     }
     TRACE_COUNT("q21_rows_scanned", li_scanned);
     TRACE_COUNT("q21_join_rows_emitted", li_emitted);
-    TRACE_COUNT("q21_orders_grouped", (uint64_t)order_info.size());
 
-    // Count numwait per RUSSIA supplier
-    std::unordered_map<int32_t, int64_t> supp_numwait; // suppkey → count
-
+    // numwait per supplier, dense indexed by suppkey (1-based).
+    std::vector<int64_t> supp_numwait(db->n_supplier + 1, 0);
     {
         PROFILE_SCOPE("q21_order_agg");
-        for (auto& [ok, info] : order_info) {
-            // For each RUSSIA supplier that is late on this order
-            for (int32_t sk : info.late_suppkeys) {
-                if (!russia_suppkeys.count(sk)) continue;
-
-                // EXISTS: another supplier on the same order (different suppkey)
-                bool has_other = false;
-                for (int32_t s2 : info.suppkeys) {
-                    if (s2 != sk) { has_other = true; break; }
-                }
-                if (!has_other) continue;
-
-                // NOT EXISTS: no other supplier that is also late
-                bool other_late = false;
-                for (int32_t s2 : info.late_suppkeys) {
-                    if (s2 != sk) { other_late = true; break; }
-                }
-                if (other_late) continue;
-
-                supp_numwait[sk]++;
-            }
+        for (int32_t j = 0; j < db->n_orders; j++) {
+            if (db->o_orderstatus[j] != 'F') continue;
+            const int32_t ok = db->o_orderkey[j];
+            const uint8_t f = flag[ok];
+            if (!(f & 1)) continue;            // need another supplier (EXISTS)
+            if (f & 2) continue;               // 2+ late suppliers kills it
+            const int32_t ls = late_supp[ok];
+            if (ls == 0) continue;             // no late supplier
+            if (is_russia[ls]) supp_numwait[ls]++;
         }
     }
-    TRACE_COUNT("q21_groups_created", (uint64_t)supp_numwait.size());
 
-    // Build results
     struct ResultRow {
-        std::string s_name;
+        const std::string* s_name;
         int64_t numwait;
     };
     std::vector<ResultRow> results;
-    for (auto& [sk, nw] : supp_numwait) {
-        results.push_back({db->s_name[sk - 1], nw});
+    for (int32_t sk = 1; sk <= db->n_supplier; sk++) {
+        if (supp_numwait[sk]) results.push_back({&db->s_name[sk - 1], supp_numwait[sk]});
     }
     TRACE_COUNT("q21_agg_rows_emitted", (uint64_t)results.size());
 
-    // Order by numwait desc, s_name asc
-    TRACE_COUNT("q21_sort_rows_in", (uint64_t)results.size());
     {
         PROFILE_SCOPE("q21_sort");
         std::sort(results.begin(), results.end(), [](const ResultRow& a, const ResultRow& b) {
             if (a.numwait != b.numwait) return a.numwait > b.numwait;
-            return a.s_name < b.s_name;
+            return *a.s_name < *b.s_name;
         });
     }
-    TRACE_COUNT("q21_sort_rows_out", (uint64_t)results.size());
 
     PROFILE_SCOPE("q21_output");
-    write_csv_header(out, {"s_name","numwait"});
+    write_csv_header(out, {"s_name", "numwait"});
     for (auto& r : results) {
-        write_csv_row(out, {csv_quote(r.s_name), std::to_string(r.numwait)});
+        write_csv_row(out, {csv_quote(*r.s_name), std::to_string(r.numwait)});
     }
     TRACE_COUNT("q21_query_output_rows", (uint64_t)results.size());
 }
